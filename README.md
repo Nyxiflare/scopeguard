@@ -26,12 +26,16 @@ Result for the [sample job](examples/logo-project/), using the $50/hour rate the
 - **Enforces revision limits:** one batch of feedback is one round, and changes past the agreed rounds become extra work.
 - **Does the money math:** time × your rate (hourly or daily, any currency), with an optional buffer and the timeline impact.
 - **Writes the reply:** in your voice, toned to the relationship, from a courtesy favour for a loyal client to a clear quote with a choice.
-- **Creates change orders:** a formal document with the extra items, why each is outside the agreement, the price, the new project total and an approval line.
+- **Creates change orders:** a formal document with the extra items, why each is outside the agreement, the price, the new project total, and each item's own approval. Grey areas must be settled first, and no item can be billed on two change orders.
 - **Keeps the full history:**
   - several projects per client
   - versioned agreements, where amendments never overwrite the original
+  - revision rounds that keep the limit they were recorded under
   - separate tracks for quote, work and invoice, so "accepted" never gets mistaken for "paid"
   - who approved each change, and where
+  - an audit trail of every event (`history`)
+- **Explains every number:** `explain` shows exactly which items make up the project total, what's paid, invoiced, not yet billed, and given away.
+- **Protects your records:** a backup before every change, `restore`, safety when two commands run at once, checks that catch a damaged or edited record, and correct decimal places for each currency.
 - **Checks proposals before you send them:** flags "unlimited revisions", "minor tweaks", "until satisfied", missing exclusions and missing change-request clauses, with replacement wording.
 - **Knows your field:** designers, developers, video editors, writers, social media managers, UGC creators, photographers and consultants.
 
@@ -57,6 +61,14 @@ Just talk to Claude:
 - Client records are saved as plain JSON on your machine in `./scopeguard-data/<client>/<project>.json`, with a backup of the previous state. The ScopeGuard script makes no network requests.
 - Documents you share with Claude are processed by the AI provider like any other conversation. For confidential contracts, remove details that aren't needed (bank details, personal addresses) first.
 - If your working folder is a public repo, add `scopeguard-data/` to `.gitignore`.
+
+## Known limitations
+
+- **Verdicts are Claude's judgement, checked against your agreement.** The unit tests prove the record keeping and money math, not the classifications. Those are measured separately with the cases in `evals/`, and ScopeGuard hasn't yet been tried by real freelancers on real projects.
+- It reads the agreement you give it. If the real deal lives in a call or a chat you didn't share, the verdicts can't reflect it.
+- One person per record: it isn't built for a team editing the same project at once from different computers.
+- No invoicing or payment integration; it tracks invoice states you record.
+- Not legal advice (see below).
 
 ## Requirements
 

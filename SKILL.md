@@ -31,9 +31,11 @@ client has more than one.
 | `SG round CLIENT --project P` | Record one batch of client feedback (a revision round) |
 | `SG log CLIENT --project P --request "..." --verdict extra --clause "..." --hours 3 [--buffer 15] [--courtesy]` | Record a request, its verdict, evidence and price |
 | `SG update CLIENT ID --quote sent\|accepted\|rejected\|expired --work in_progress\|done --invoice invoiced\|paid\|overdue --approved-by NAME --evidence "..."` | Record what happened next |
-| `SG change-order CLIENT ID [ID ...] --timeline "+2 days" --out co-1.md` | A formal change order for accepted or proposed extras |
+| `SG update CLIENT ID --verdict extra --reason "client confirmed it wasn't included"` | Settle a grey area (or correct a verdict) with the reason on record |
+| `SG change-order CLIENT ID [ID ...] --timeline "+2 days" --out co-1.md` | A formal change order for confirmed extras, with per-item approvals |
 | `SG report CLIENT --project P [--out report.md]` | Agreement history, rounds, money by state, change log |
-| `SG list` / `SG restore CLIENT --project P` | All projects at a glance / recover from the last good copy |
+| `SG explain CLIENT --project P` / `SG history CLIENT --project P` | How every total is calculated / the audit trail |
+| `SG list` / `SG restore CLIENT --project P` | All projects at a glance / go back to the state before the last change |
 | `SG quote --rate 60 --hours 3` | One-off price without a record |
 
 ## Pick the mode
@@ -113,7 +115,7 @@ For each one, decide:
 | **Included** | The agreement covers it | Listed deliverable, within quantity, a fix of your own mistake |
 | **Revision** | A change to something already in scope and not yet locked | Adjusting colour, copy, timing, layout of an agreed item. Counts toward the round cap |
 | **Grey area** | The agreement is silent or ambiguous | Not listed, not excluded; vague wording like "website" with no page count |
-| **Extra** | Clearly beyond the agreement | New deliverable, more than the agreed quantity, new format/size/platform, reversing an approved and locked decision, rework caused by the client's late or changed inputs, rounds beyond the cap |
+| **Extra** | Clearly beyond the agreement | New deliverable, more than the agreed quantity, a new version of a deliverable whose format the agreement fixes (16:9 video → 9:16), reversing an approved and locked decision, rework caused by the client's late or changed inputs, rounds beyond the cap |
 
 Rules that keep this fair:
 - **Quote the evidence.** Every verdict cites the exact line it's based on ("Section 3: *includes 3
@@ -121,6 +123,10 @@ Rules that keep this fair:
   defensible, and it's the difference between ScopeGuard and a guess.
 - **Silence means grey, not extra.** Don't stretch the agreement to charge for something it never
   addressed. Grey items get a clarifying question and, if the user wants, a price for the record.
+- **New format vs. new asset:** a different version of something the agreement pins down (a video
+  agreed as 16:9, now wanted as 9:16) is extra. A new kind of asset the agreement never mentions
+  (social profile images on a logo project, meta descriptions on a copy job) is grey: it's silence,
+  not an exclusion, unless the exclusions list or a quantity limit covers it.
 - **Be honest when the client is right.** Bugs and defects in the user's own work, or things clearly
   listed, are included even if they're annoying. Saying so builds trust and keeps the user credible
   when they do push back.
@@ -164,8 +170,11 @@ when they can see the trade-off.
 Write one message that covers every item, in the user's voice. If the user wants something more
 formal than a message (bigger extras, a new client, an agency), also generate a change order with
 `SG change-order`. Usually it's generated *before* approval: it's what the client signs, and it
-marks those quotes as sent. If the approval is already recorded, the change order fills in who
-approved it and where instead of blank sign-off lines, so it works as a confirmation too. Pick the tone from
+marks those quotes as sent. Each item shows its own approval (who, when, where) or "awaiting
+approval", and only the unapproved items get a sign-off line, so one person's approval is never
+presented as covering everything. Change orders only take confirmed extras: a grey item must be
+settled with the client first and reclassified (`SG update ID --verdict extra --reason "..."`), and
+courtesy, rejected, expired or already-ordered items are refused. Pick the tone from
 `references/reply-playbook.md` based on the relationship and the size of the ask. The core moves:
 
 - Open warmly and stay on the same side as the client ("Happy to help with this").
@@ -191,9 +200,12 @@ Each extra has three separate tracks, because an approved quote isn't money in t
 | Invoice | not_invoiced → invoiced → partially_paid / paid / overdue |
 
 Update them as things happen (`SG update`). When the client accepts, record who and where
-(`--approved-by`, `--evidence "WhatsApp 3 Dec 10:14"`) so there's proof later. Only accepted work can
-be invoiced. Offer `SG report` when there are several items or the user asks how things stand; it
-shows accepted extras not yet invoiced, which is often money the user forgot to bill. When the
+(`--approved-by`, `--evidence "WhatsApp 3 Dec 10:14"`) so there's proof later. Only accepted,
+chargeable work that's done can be invoiced (`--advance` for an agreed upfront invoice), and an
+invoiced price can't change. Offer `SG report` when there are several items or the user asks how
+things stand; it shows accepted extras not yet invoiced, which is often money the user forgot to
+bill. When the user asks *why* a total is what it is, run `SG explain`: it lists every item that
+makes up the total. `SG history` shows the audit trail of everything recorded. When the
 "given away" total gets meaningful, say so and offer the "let's regroup on scope" message from the
 playbook.
 
