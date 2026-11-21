@@ -7,18 +7,22 @@ several independent projects, each with its own agreement, revision rounds and m
 
 Commands
   init CLIENT --rate 50 [--unit hour|day] [--currency USD] [--price 600] [--revisions 2]
-  agreement CLIENT --file scope.json [--note TEXT] [--approved-by NAME] [--evidence TEXT]
+  agreement CLIENT --file scope.json [--note TEXT] [--approved-by NAME] [--evidence TEXT] [--absorbs ID ...]
         First call stores version 1 (the original agreement). Later calls add an amendment as a new
         version; earlier versions are never changed. ("baseline" is an alias.)
   round CLIENT [--note TEXT]                     record one batch of client feedback (a revision round)
   log CLIENT --request TEXT --verdict included|revision|grey|extra [--clause TEXT]
         [--hours N | --days N | --fixed AMOUNT] [--buffer PCT] [--courtesy] [--allow-over-cap] [--note TEXT]
-  update CLIENT ID [--quote draft|sent|accepted|rejected|expired] [--work not_started|in_progress|done]
-        [--invoice not_invoiced|invoiced|partially_paid|paid|overdue] [--courtesy | --no-courtesy]
-        [--approved-by NAME] [--evidence TEXT] [--hours N | --days N | --fixed AMOUNT] [--note TEXT]
+  update CLIENT ID [--verdict V --reason TEXT] [--quote draft|sent|accepted|rejected|expired]
+        [--work not_started|in_progress|done] [--invoice not_invoiced|invoiced|partially_paid|paid|overdue]
+        [--advance] [--courtesy | --no-courtesy] [--approved-by NAME] [--evidence TEXT]
+        [--hours N | --days N | --fixed AMOUNT] [--note TEXT]
   change-order CLIENT ID [ID ...] [--timeline TEXT] [--out FILE.md]
   report CLIENT [--out FILE.md]
+  explain CLIENT                                 how every total is calculated, item by item
+  history CLIENT                                 the audit trail of every recorded event
   list
+  restore CLIENT                                 go back to the state before the last change
   quote --rate 50 (--hours N | --days N) [--unit hour|day] [--buffer PCT] [--currency USD]
 
 Records live in ./scopeguard-data/<client>/<project>.json (or --data-dir), with a .bak copy of the
@@ -42,8 +46,13 @@ VERDICTS = ("included", "revision", "grey", "extra")
 QUOTE = ("draft", "sent", "accepted", "rejected", "expired", "n/a")
 WORK = ("not_started", "in_progress", "done")
 INVOICE = ("not_invoiced", "invoiced", "partially_paid", "paid", "overdue", "n/a")
+INVOICED = ("invoiced", "partially_paid", "paid", "overdue")
 UNITS = ("hour", "day")
-SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "INR": "₹", "JPY": "¥", "AUD": "A$", "CAD": "C$"}
+SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "INR": "₹", "JPY": "¥", "AUD": "A$", "CAD": "C$",
+           "KRW": "₩", "BRL": "R$", "MXN": "MX$", "SGD": "S$", "NZD": "NZ$", "PHP": "₱", "NGN": "₦"}
+# Decimal places per currency (ISO 4217 minor units). Anything not listed uses 2.
+MINOR_UNITS = {"JPY": 0, "KRW": 0, "VND": 0, "CLP": 0, "ISK": 0, "UGX": 0, "PYG": 0, "XOF": 0, "XAF": 0,
+               "IDR": 2, "BHD": 3, "KWD": 3, "OMR": 3, "JOD": 3, "TND": 3, "IQD": 3, "LYD": 3}
 SCOPE_KEYS = ("deliverables", "exclusions", "revision_definition", "deadline", "payment_terms",
               "client_responsibilities", "approval_gates", "silent_on", "notes")
 # v1 single "status" -> v2 tracks (also accepted on the command line for convenience)
@@ -72,23 +81,51 @@ def now() -> str:
     return dt.datetime.now().replace(microsecond=0).isoformat()
 
 
+def minor_units(currency: str) -> int:
+    return MINOR_UNITS.get(currency.upper(), 2)
+
+
 def money(value: Decimal, currency: str) -> str:
-    q = value.quantize(Decimal("1") if currency == "JPY" else Decimal("0.01"), rounding=ROUND_HALF_UP)
+    places = minor_units(currency)
+    q = value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
     text = f"{q:,}"
-    if text.endswith(".00"):
-        text = text[:-3]
+    if places and text.endswith("." + "0" * places):
+        text = text[: -(places + 1)]
     sym = SYMBOLS.get(currency.upper())
     return f"{sym}{text}" if sym else f"{text} {currency.upper()}"
 
 
-def dec(value, name: str) -> Decimal:
+def dec(value, name: str, allow_zero: bool = True) -> Decimal:
     try:
         d = Decimal(str(value))
     except (InvalidOperation, ValueError):
         fail(f"{name} must be a number, got '{value}'.")
-    if not d.is_finite() or d < 0:
-        fail(f"{name} must be a positive number.")
+    if not d.is_finite() or d < 0 or (not allow_zero and d == 0):
+        fail(f"{name} must be a {'positive' if not allow_zero else 'non-negative'} number, got '{value}'.")
     return d
+
+
+def count(value, name: str):
+    """A revision limit: None or a whole number >= 0."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        try:
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value)
+        except ValueError:
+            pass
+        fail(f"{name} must be a whole number (0 or more), got '{value}'.")
+    if value < 0:
+        fail(f"{name} can't be negative.")
+    return value
+
+
+def hours_per_day(value) -> float:
+    d = dec(value, "--hours-per-day", allow_zero=False)
+    if d > 24:
+        fail("--hours-per-day can't be more than 24.")
+    return float(d)
 
 
 def slug(name: str) -> str:
@@ -98,29 +135,124 @@ def slug(name: str) -> str:
     return s
 
 
-# --------------------------------------------------------------------------- storage
+def md(text) -> str:
+    """Make user text safe inside a Markdown table cell or line."""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    return s.replace("\\", "\\\\").replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def log_event(led: dict, event: str, detail: str) -> None:
+    led.setdefault("events", []).append({"at": now(), "event": event, "detail": detail})
+
+
+# --------------------------------------------------------------------------- validation
+
+def _is_money(v) -> bool:
+    if v is None:
+        return True
+    try:
+        d = Decimal(str(v))
+    except (InvalidOperation, ValueError):
+        return False
+    return d.is_finite() and d >= 0
+
 
 def validate(led: dict, where: str) -> None:
-    problems = []
+    """Check the whole record, including references between its parts. Lists every problem found."""
+    p: list[str] = []
     for key, kind in (("client", str), ("project", str), ("currency", str), ("rate", str),
                       ("rate_unit", str), ("agreement", list), ("rounds", list), ("requests", list)):
         if not isinstance(led.get(key), kind):
-            problems.append(f"'{key}' missing or not a {kind.__name__}")
-    if led.get("rate_unit") not in UNITS:
-        problems.append("rate_unit must be hour or day")
-    ids = set()
-    for r in led.get("requests", []) if isinstance(led.get("requests"), list) else []:
-        if not isinstance(r, dict) or "id" not in r:
-            problems.append("a request has no id")
-            continue
-        if r["id"] in ids:
-            problems.append(f"request id {r['id']} appears twice")
-        ids.add(r["id"])
-        if r.get("verdict") not in VERDICTS:
-            problems.append(f"request {r['id']} has an unknown verdict")
-    if problems:
-        fail(f"{where} doesn't look like a valid ScopeGuard record: " + "; ".join(problems[:5]))
+            p.append(f"'{key}' is missing or not a {kind.__name__}")
+    if p:
+        fail(f"{where} doesn't look like a valid ScopeGuard record: " + "; ".join(p))
+    if led["rate_unit"] not in UNITS:
+        p.append("rate_unit must be hour or day")
+    if not _is_money(led["rate"]):
+        p.append("rate is not a valid amount")
+    try:
+        hpd = Decimal(str(led.get("hours_per_day", 8)))
+        if not hpd.is_finite() or hpd <= 0 or hpd > 24:
+            p.append("hours_per_day must be between 0 and 24")
+    except InvalidOperation:
+        p.append("hours_per_day is not a number")
 
+    versions = []
+    for i, v in enumerate(led["agreement"], 1):
+        if not isinstance(v, dict):
+            p.append(f"agreement entry {i} is not an object")
+            continue
+        if v.get("version") != i:
+            p.append(f"agreement versions must run 1, 2, 3… (entry {i} says {v.get('version')})")
+        if not _is_money(v.get("price")):
+            p.append(f"agreement v{i} has an invalid price")
+        rc = v.get("revisions_included")
+        if rc is not None and (isinstance(rc, bool) or not isinstance(rc, int) or rc < 0):
+            p.append(f"agreement v{i} has an invalid revision limit")
+        if not isinstance(v.get("scope", {}), dict):
+            p.append(f"agreement v{i} scope is not an object")
+        versions.append(i)
+    vset = set(versions) | {0}
+
+    rset = set()
+    for i, r in enumerate(led["rounds"], 1):
+        if not isinstance(r, dict) or r.get("round") != i:
+            p.append(f"revision rounds must run 1, 2, 3… (entry {i})")
+            continue
+        if r.get("agreement_version", 0) not in vset:
+            p.append(f"round {i} points to agreement v{r.get('agreement_version')}, which doesn't exist")
+        rset.add(i)
+
+    co_numbers = set()
+    co_members: dict[int, int] = {}
+    for i, co in enumerate(led.get("change_orders", []), 1):
+        if not isinstance(co, dict) or co.get("number") != i:
+            p.append(f"change orders must be numbered 1, 2, 3… (entry {i})")
+            continue
+        co_numbers.add(i)
+        for rid in co.get("items", []):
+            if rid in co_members:
+                p.append(f"request {rid} is on change orders {co_members[rid]} and {i}")
+            co_members[rid] = i
+
+    ids = set()
+    for r in led["requests"]:
+        if not isinstance(r, dict) or not isinstance(r.get("id"), int):
+            p.append("a request has no numeric id")
+            continue
+        rid = r["id"]
+        if rid in ids:
+            p.append(f"request id {rid} appears twice")
+        ids.add(rid)
+        if r.get("verdict") not in VERDICTS:
+            p.append(f"request {rid} has an unknown verdict '{r.get('verdict')}'")
+        for field, allowed in (("quote", QUOTE), ("work", WORK), ("invoice", INVOICE)):
+            if r.get(field) not in allowed:
+                p.append(f"request {rid} has an unknown {field} state '{r.get(field)}'")
+        if not _is_money(r.get("cost")):
+            p.append(f"request {rid} has an invalid cost")
+        if r.get("agreement_version", 0) not in vset:
+            p.append(f"request {rid} points to agreement v{r.get('agreement_version')}, which doesn't exist")
+        if r.get("round") is not None and r["round"] not in rset:
+            p.append(f"request {rid} points to round {r['round']}, which doesn't exist")
+        if r.get("absorbed_in") is not None and r["absorbed_in"] not in vset - {0}:
+            p.append(f"request {rid} is absorbed in agreement v{r['absorbed_in']}, which doesn't exist")
+        if r.get("change_order") is not None and r["change_order"] not in co_numbers:
+            p.append(f"request {rid} points to change order {r['change_order']}, which doesn't exist")
+        if r.get("invoice") in INVOICED and (r.get("quote") != "accepted" or r.get("complimentary")):
+            p.append(f"request {rid} is invoiced but not an accepted, chargeable extra")
+    for rid in co_members:
+        if rid not in ids:
+            p.append(f"a change order lists request {rid}, which doesn't exist")
+    for v in led["agreement"]:
+        for rid in v.get("absorbs", []) if isinstance(v, dict) else []:
+            if rid not in ids:
+                p.append(f"agreement v{v.get('version')} absorbs request {rid}, which doesn't exist")
+    if p:
+        fail(f"{where} has {len(p)} problem(s): " + "; ".join(p[:8]) + ("…" if len(p) > 8 else ""))
+
+
+# --------------------------------------------------------------------------- storage
 
 def migrate_v1(old: dict, project: str) -> dict:
     """Convert a version-1 record (single status, overwritten baseline) to schema 2."""
@@ -128,89 +260,50 @@ def migrate_v1(old: dict, project: str) -> dict:
         "schema": SCHEMA, "client": old["client"], "project": old.get("project") or project,
         "currency": old.get("currency", "USD"), "rate": old["rate"], "rate_unit": old.get("rate_unit", "hour"),
         "hours_per_day": old.get("hours_per_day", 8), "agreement": [], "rounds": [], "requests": [],
-        "change_orders": [], "created": old.get("created", now()), "rev": 0,
+        "change_orders": [], "events": [], "created": old.get("created", now()), "rev": 0,
     }
     scope = {k: v for k, v in (old.get("baseline") or {}).items() if k in SCOPE_KEYS}
     led["agreement"].append({
         "version": 1, "effective": (old.get("created") or today())[:10], "note": "original (migrated)",
         "source": (old.get("baseline") or {}).get("source", ""), "approved_by": "", "evidence": "",
-        "price": old.get("original_price"), "revisions_included": old.get("revisions_included"), "scope": scope,
+        "price": old.get("original_price"), "revisions_included": old.get("revisions_included"),
+        "scope": scope, "absorbs": [],
     })
     for n in range(1, int(old.get("revisions_used", 0)) + 1):
-        led["rounds"].append({"round": n, "date": "", "note": "migrated"})
+        led["rounds"].append({"round": n, "date": "", "note": "migrated", "agreement_version": 1,
+                              "cap": old.get("revisions_included")})
     for r in old.get("requests", []):
+        is_extra = r.get("verdict") in ("extra", "grey")
         new = {"id": r["id"], "date": r.get("date", ""), "request": r.get("request", ""),
                "verdict": r.get("verdict", "grey"), "clause": r.get("clause", ""), "cost": r.get("cost"),
                "priced_as": r.get("priced_as", ""), "agreement_version": 1, "round": r.get("round"),
-               "quote": "draft" if r.get("verdict") in ("extra", "grey") else "n/a", "work": "not_started",
-               "invoice": "not_invoiced" if r.get("verdict") in ("extra", "grey") else "n/a",
+               "over_cap": False, "quote": "draft" if is_extra else "n/a", "work": "not_started",
+               "invoice": "not_invoiced" if is_extra else "n/a",
                "complimentary": False, "approval": {}, "note": r.get("note", "")}
+        if new["round"] is not None and new["round"] > len(led["rounds"]):
+            new["round"] = None
         for k, v in OLD_STATUS.get(r.get("status", ""), {}).items():
             new[k] = v
         if new["complimentary"]:
             new["invoice"] = "n/a"
         led["requests"].append(new)
+    log_event(led, "migrated", "upgraded from the first record format")
     return led
 
 
-class Store:
-    def __init__(self, data_dir: str | None):
-        self.dir = Path(data_dir) if data_dir else Path.cwd() / "scopeguard-data"
-
-    def path(self, client: str, project: str) -> Path:
-        return self.dir / slug(client) / f"{slug(project)}.json"
-
-    def _read(self, p: Path) -> dict:
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            bak = p.with_suffix(".json.bak")
-            msg = f"{p} is damaged (line {e.lineno}: {e.msg})."
-            if bak.is_file():
-                msg += f" The previous good copy is {bak}. Restore it with:  restore CLIENT --project NAME"
-            fail(msg)
-
-    def load(self, client: str, project: str) -> dict:
-        p = self.path(client, project)
-        if not p.is_file():
-            legacy = self.dir / f"{slug(client)}.json"
-            if legacy.is_file() and slug(project) == "main":
-                led = migrate_v1(self._read(legacy), project)
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(json.dumps(led, indent=2, ensure_ascii=False), encoding="utf-8")
-                legacy.rename(legacy.with_suffix(".json.v1-migrated"))
-                out(f"Note: moved the old record for {client} to {p} (new format).")
-            else:
-                others = sorted(x.stem for x in (self.dir / slug(client)).glob("*.json")) \
-                    if (self.dir / slug(client)).is_dir() else []
-                hint = f" Projects on file: {', '.join(others)}." if others else ""
-                fail(f"No record for '{client}' / project '{project}'.{hint} "
-                     f"Start one with:  init \"{client}\" --project \"{project}\" --rate YOUR_RATE")
-        led = self._read(p)
-        if led.get("schema") != SCHEMA:
-            led = migrate_v1(led, project)
-        validate(led, str(p))
-        led["_path"] = str(p)
-        led["_loaded_rev"] = led.get("rev", 0)
-        return led
-
-    def save(self, led: dict) -> Path:
-        p = Path(led.pop("_path", "")) if led.get("_path") else self.path(led["client"], led["project"])
-        loaded_rev = led.pop("_loaded_rev", None)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with Lock(p):
-            if p.is_file():
-                current = self._read(p)
-                if loaded_rev is not None and current.get("rev", 0) != loaded_rev:
-                    fail(f"{p} was changed by another command while this one ran. Nothing was saved; run it again.")
-                shutil.copy2(p, p.with_suffix(".json.bak"))
-            led["rev"] = int(led.get("rev", 0)) + 1
-            led["updated"] = now()
-            validate(led, "the new record")
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(led, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, p)
-        return p
+def upgrade_v2(led: dict) -> dict:
+    """Fill fields added in v2.1 to records written by v2.0, without changing any recorded fact."""
+    caps = {v["version"]: v.get("revisions_included") for v in led.get("agreement", []) if isinstance(v, dict)}
+    for r in led.get("rounds", []):
+        if isinstance(r, dict) and "agreement_version" not in r:
+            r["agreement_version"] = 1 if caps else 0
+            r["cap"] = caps.get(1)
+    for v in led.get("agreement", []):
+        if isinstance(v, dict):
+            v.setdefault("absorbs", [])
+    led.setdefault("change_orders", [])
+    led.setdefault("events", [])
+    return led
 
 
 class Lock:
@@ -220,6 +313,7 @@ class Lock:
         self.lock = p.with_suffix(".json.lock")
 
     def __enter__(self):
+        self.lock.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.time() + 5
         while True:
             try:
@@ -245,16 +339,101 @@ class Lock:
             pass
 
 
+def atomic_write(p: Path, data: dict) -> None:
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+class Store:
+    def __init__(self, data_dir: str | None):
+        self.dir = Path(data_dir) if data_dir else Path.cwd() / "scopeguard-data"
+
+    def path(self, client: str, project: str) -> Path:
+        return self.dir / slug(client) / f"{slug(project)}.json"
+
+    def _read(self, p: Path) -> dict:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            bak = p.with_suffix(".json.bak")
+            msg = f"{p} is damaged (line {e.lineno}: {e.msg})."
+            if bak.is_file():
+                msg += " The previous good copy can be put back with:  restore CLIENT --project NAME"
+            fail(msg)
+        if not isinstance(data, dict):
+            fail(f"{p} doesn't look like a valid ScopeGuard record (it isn't a JSON object).")
+        return data
+
+    def load(self, client: str, project: str) -> dict:
+        p = self.path(client, project)
+        if not p.is_file():
+            legacy = self.dir / f"{slug(client)}.json"
+            if legacy.is_file() and slug(project) == "main":
+                with Lock(p):
+                    led = migrate_v1(self._read(legacy), project)
+                    validate(led, str(legacy))
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write(p, led)
+                    legacy.rename(legacy.with_suffix(".json.v1-migrated"))
+                out(f"Note: moved the old record for {client} to {p} (new format).")
+            else:
+                others = sorted(x.stem for x in (self.dir / slug(client)).glob("*.json")) \
+                    if (self.dir / slug(client)).is_dir() else []
+                hint = f" Projects on file: {', '.join(others)}." if others else ""
+                fail(f"No record for '{client}' / project '{project}'.{hint} "
+                     f"Start one with:  init \"{client}\" --project \"{project}\" --rate YOUR_RATE")
+        led = self._read(p)
+        led = upgrade_v2(led) if led.get("schema") == SCHEMA else migrate_v1(led, project)
+        validate(led, str(p))
+        led["_path"] = str(p)
+        led["_loaded_rev"] = led.get("rev", 0)
+        return led
+
+    def create(self, led: dict, force: bool) -> Path:
+        """Create a new record. Checks for an existing one under the lock, so two inits can't both win."""
+        p = self.path(led["client"], led["project"])
+        with Lock(p):
+            if p.exists():
+                if not force:
+                    fail(f"{led['client']} / {led['project']} already has a record ({p}). To start over, add --force "
+                         "(a backup copy is kept), or use a different --project name.")
+                backup = p.with_name(f"{p.stem}.reset-{dt.datetime.now():%Y%m%d-%H%M%S}.json.bak")
+                shutil.copy2(p, backup)
+                out(f"Backed up the old record to {backup}")
+                led["events"].append({"at": now(), "event": "reset", "detail": f"started over; old record in {backup.name}"})
+            led["rev"] = 1
+            led["updated"] = now()
+            validate(led, "the new record")
+            atomic_write(p, led)
+        return p
+
+    def save(self, led: dict) -> Path:
+        p = Path(led.pop("_path"))
+        loaded_rev = led.pop("_loaded_rev", None)
+        with Lock(p):
+            if p.is_file():
+                current = self._read(p)
+                if loaded_rev is not None and current.get("rev", 0) != loaded_rev:
+                    fail(f"{p} was changed by another command while this one ran. Nothing was saved; run it again.")
+                shutil.copy2(p, p.with_suffix(".json.bak"))
+            led["rev"] = int(led.get("rev", 0)) + 1
+            led["updated"] = now()
+            validate(led, "the new record")
+            atomic_write(p, led)
+        return p
+
+
 # --------------------------------------------------------------------------- helpers
 
 def current_agreement(led: dict) -> dict:
     if not led["agreement"]:
-        return {"version": 0, "price": None, "revisions_included": None, "scope": {}}
+        return {"version": 0, "price": None, "revisions_included": None, "scope": {}, "source": ""}
     return led["agreement"][-1]
 
 
-def cap_of(led: dict):
-    return current_agreement(led).get("revisions_included")
+def version_of(led: dict, n: int) -> dict:
+    return led["agreement"][n - 1] if n else current_agreement(led)
 
 
 def cost_of(led: dict, hours=None, days=None, fixed=None, buffer=None):
@@ -263,7 +442,7 @@ def cost_of(led: dict, hours=None, days=None, fixed=None, buffer=None):
     if hours is None and days is None:
         return None, "not priced"
     rate = Decimal(led["rate"])
-    hpd = Decimal(str(led.get("hours_per_day", 8)))
+    hpd = Decimal(str(hours_per_day(led.get("hours_per_day", 8))))
     unit = led["rate_unit"]
     if hours is not None:
         qty = dec(hours, "--hours")
@@ -284,6 +463,11 @@ def find(led: dict, rid: int) -> dict:
         if r["id"] == rid:
             return r
     fail(f"No request #{rid} in {led['client']} / {led['project']}.")
+
+
+def is_extra(r: dict) -> bool:
+    """Confirmed extra work: an 'extra' verdict or a revision beyond the agreed rounds."""
+    return r["verdict"] == "extra" or bool(r.get("over_cap"))
 
 
 def billable(r: dict) -> bool:
@@ -323,29 +507,40 @@ def totals(led: dict) -> dict:
     return {"money": m, "counts": c, "unpriced": unpriced}
 
 
+def approval_text(r: dict) -> str:
+    ap = r.get("approval") or {}
+    if not ap.get("by"):
+        return "awaiting approval"
+    return md(", ".join(x for x in (ap.get("by"), ap.get("date"), ap.get("evidence")) if x))
+
+
 # --------------------------------------------------------------------------- commands
 
 def cmd_init(a, st: Store) -> int:
-    p = st.path(a.client, a.project)
-    if p.exists():
-        if not a.force:
-            fail(f"{a.client} / {a.project} already has a record ({p}). To start over, add --force "
-                 "(a backup copy is kept), or use a different --project name.")
-        backup = p.with_name(f"{p.stem}.reset-{dt.datetime.now():%Y%m%d-%H%M%S}.json.bak")
-        shutil.copy2(p, backup)
-        out(f"Backed up the old record to {backup}")
-        p.unlink()
+    hpd = hours_per_day(a.hours_per_day)
+    revisions = count(a.revisions, "--revisions")
+    client_dir = st.dir / slug(a.client)
+    for f in client_dir.glob("*.json") if client_dir.is_dir() else []:
+        try:
+            other = json.loads(f.read_text(encoding="utf-8")).get("client", "")
+        except (json.JSONDecodeError, OSError):
+            continue
+        if other and other.strip().lower() != a.client.strip().lower():
+            fail(f"'{a.client}' would share a folder with the existing client '{other}' ({client_dir}). "
+                 "Use a more distinct client name so their records stay separate.")
     led = {
         "schema": SCHEMA, "client": a.client, "project": a.project, "currency": a.currency.upper(),
-        "rate": str(dec(a.rate, "--rate")), "rate_unit": a.unit, "hours_per_day": a.hours_per_day,
-        "agreement": [], "rounds": [], "requests": [], "change_orders": [], "created": now(), "rev": 0,
+        "rate": str(dec(a.rate, "--rate")), "rate_unit": a.unit, "hours_per_day": hpd,
+        "agreement": [], "rounds": [], "requests": [], "change_orders": [], "events": [],
+        "created": now(), "rev": 0,
     }
-    if a.price is not None or a.revisions is not None:
+    if a.price is not None or revisions is not None:
         led["agreement"].append({"version": 1, "effective": today(), "note": "original", "source": "",
                                  "approved_by": "", "evidence": "",
                                  "price": str(dec(a.price, "--price")) if a.price is not None else None,
-                                 "revisions_included": a.revisions, "scope": {}})
-    path = st.save(led)
+                                 "revisions_included": revisions, "scope": {}, "absorbs": []})
+    log_event(led, "project created", f"rate {money(Decimal(led['rate']), led['currency'])}/{a.unit}")
+    path = st.create(led, a.force)
     out(f"Started {a.client} / {a.project} at {path}")
     out(f"Rate: {money(Decimal(led['rate']), led['currency'])}/{a.unit}")
     return 0
@@ -367,31 +562,55 @@ def cmd_agreement(a, st: Store) -> int:
         out(f"Note: ignored unknown keys {ignored}")
     prev = current_agreement(led)
     price = data.get("price", data.get("original_price", prev.get("price")))
+    revisions = count(data["revisions_included"], "revisions_included") if "revisions_included" in data \
+        else prev.get("revisions_included")
+    absorbs = list(a.absorbs or [])
+
+    # Validate everything before touching the record.
+    if len(set(absorbs)) != len(absorbs):
+        fail("--absorbs lists the same request more than once.")
+    for rid in absorbs:
+        r = find(led, rid)
+        if not is_extra(r) or r.get("complimentary") or r["quote"] != "accepted":
+            fail(f"#{rid} can't be absorbed: only accepted, chargeable extras can be folded into an amendment "
+                 f"(it is {r['verdict']}, quote {r['quote']}{', courtesy' if r.get('complimentary') else ''}).")
+        if r.get("absorbed_in"):
+            fail(f"#{rid} is already part of agreement v{r['absorbed_in']}.")
+    if absorbs and prev["version"] == 0:
+        fail("--absorbs only makes sense for an amendment, after the original agreement is saved.")
+
     version = {
         "version": prev["version"] + 1, "effective": data.get("effective") or today(),
         "note": a.note or ("original" if prev["version"] == 0 else "amendment"),
         "source": data.get("source", ""), "approved_by": a.approved_by or "", "evidence": a.evidence or "",
         "price": str(dec(price, "price")) if price is not None else None,
-        "revisions_included": data.get("revisions_included", prev.get("revisions_included")),
+        "revisions_included": revisions,
         "scope": {**(prev.get("scope") or {}), **{k: v for k, v in data.items() if k in SCOPE_KEYS}},
-        "absorbs": list(a.absorbs or []),
+        "absorbs": absorbs,
     }
     # The very first agreement can fill in a version 1 that init created with only price/revisions.
-    if prev["version"] == 1 and not prev.get("scope") and not led["requests"] and not a.note:
-        version["version"] = 1
-        version["note"] = "original"
+    if prev["version"] == 1 and not prev.get("scope") and not led["requests"] and not led["rounds"] and not a.note:
+        version["version"], version["note"] = 1, "original"
         led["agreement"][-1] = version
+        log_event(led, "agreement saved", "version 1 (original)")
     else:
         if version["version"] > 1 and not (a.approved_by or a.evidence):
             out("Note: amendments are stronger with --approved-by and --evidence (who agreed, and where).")
-        for rid in version["absorbs"]:
-            find(led, rid)["absorbed_in"] = version["version"]
-        loose = [r for r in led["requests"] if billable(r) and r["quote"] == "accepted" and not r.get("absorbed_in")]
-        if version["version"] > 1 and prev.get("price") != version["price"] and loose and not version["absorbs"]:
+        loose = [r for r in led["requests"] if billable(r) and r["quote"] == "accepted"
+                 and not r.get("absorbed_in") and r["id"] not in absorbs]
+        if version["version"] > 1 and prev.get("price") != version["price"] and loose and not absorbs:
             out("Note: the price changed and there are accepted extras (" + ", ".join(f"#{r['id']}" for r in loose)
                 + "). If this amendment's price already includes them, run it with --absorbs ID so they aren't "
                   "counted twice in the project total.")
+        if version["version"] > 1 and prev.get("revisions_included") != revisions:
+            done = len(led["rounds"])
+            out(f"Note: the revision limit changes from {prev.get('revisions_included')} to {revisions} for rounds "
+                f"recorded from now on. The {done} round(s) already recorded keep the limit they had.")
         led["agreement"].append(version)
+        for rid in absorbs:
+            find(led, rid)["absorbed_in"] = version["version"]
+        log_event(led, "agreement saved", f"version {version['version']} ({version['note']})"
+                  + (f", absorbs {', '.join('#' + str(i) for i in absorbs)}" if absorbs else ""))
     st.save(led)
     v = version
     out(f"Saved agreement version {v['version']} ({v['note']}) for {led['client']} / {led['project']}: "
@@ -403,10 +622,13 @@ def cmd_agreement(a, st: Store) -> int:
 
 def cmd_round(a, st: Store) -> int:
     led = st.load(a.client, a.project)
+    agr = current_agreement(led)
     n = len(led["rounds"]) + 1
-    led["rounds"].append({"round": n, "date": today(), "note": a.note or ""})
+    cap = agr.get("revisions_included")
+    led["rounds"].append({"round": n, "date": today(), "note": a.note or "", "agreement_version": agr["version"],
+                          "cap": cap})
+    log_event(led, "revision round", f"round {n} under agreement v{agr['version']} (limit {cap})")
     st.save(led)
-    cap = cap_of(led)
     if cap is None:
         out(f"Revision round {n} recorded. The agreement sets no limit on rounds; worth fixing next time.")
     elif n <= cap:
@@ -422,13 +644,20 @@ def cmd_log(a, st: Store) -> int:
     if a.verdict not in VERDICTS:
         fail(f"--verdict must be one of {', '.join(VERDICTS)}.")
     agr = current_agreement(led)
+    agr_version = agr["version"]
     cost, how = cost_of(led, a.hours, a.days, a.fixed, a.buffer)
     rnd, over = None, False
     if a.verdict == "revision":
         if not led["rounds"]:
             fail("Record the feedback round first:  round CLIENT --project NAME  (one round per batch of feedback).")
-        rnd = led["rounds"][-1]["round"]
-        cap = agr.get("revisions_included")
+        last = led["rounds"][-1]
+        rnd = last["round"]
+        # A revision belongs to the round's agreement version and limit, not whatever is current now.
+        agr_version = last.get("agreement_version", agr_version)
+        if agr_version != agr["version"]:
+            out(f"Note: round {rnd} was recorded under agreement v{agr_version}, so this revision is judged "
+                f"against v{agr_version}. For feedback that arrived after the amendment, record a new round first.")
+        cap = last.get("cap")
         over = cap is not None and rnd > cap
         if over and not (a.courtesy or a.allow_over_cap):
             fail(f"Round {rnd} is beyond the {cap} revision rounds included, so this change is extra work. "
@@ -437,25 +666,27 @@ def cmd_log(a, st: Store) -> int:
     if covered and cost is not None and not a.courtesy:
         out("Note: included work and in-limit revisions are covered by the agreed price, so no cost is recorded.")
         cost, how = None, "covered by the agreement"
-    is_extra = a.verdict in ("extra", "grey") or over
+    extra_like = a.verdict in ("extra", "grey") or over
     rid = max((r["id"] for r in led["requests"]), default=0) + 1
     rec = {
         "id": rid, "date": now(), "request": a.request, "verdict": a.verdict, "clause": a.clause or "",
-        "cost": str(cost) if cost is not None else None, "priced_as": how, "agreement_version": agr["version"],
+        "cost": str(cost) if cost is not None else None, "priced_as": how, "agreement_version": agr_version,
         "round": rnd, "over_cap": over,
-        "quote": "n/a" if (a.courtesy or not is_extra) else "draft", "work": "not_started",
-        "invoice": "n/a" if (a.courtesy or not is_extra) else "not_invoiced",
+        "quote": "n/a" if (a.courtesy or not extra_like) else "draft", "work": "not_started",
+        "invoice": "n/a" if (a.courtesy or not extra_like) else "not_invoiced",
         "complimentary": bool(a.courtesy), "approval": {}, "note": a.note or "",
     }
     led["requests"].append(rec)
+    log_event(led, "request logged", f"#{rid} {a.verdict}{' (courtesy)' if a.courtesy else ''}: {a.request}"
+              + (f", {money(cost, led['currency'])}" if cost is not None else ""))
     st.save(led)
     label = {"included": "INCLUDED", "grey": "GREY AREA", "extra": "EXTRA", "revision": "REVISION"}[a.verdict]
-    extra_bits = []
+    bits = []
     if rnd:
-        extra_bits.append(f"round {rnd}" + (" (over the limit)" if over else ""))
+        bits.append(f"round {rnd}" + (" (over the limit)" if over else ""))
     if a.courtesy:
-        extra_bits.append("courtesy, no charge")
-    tail = f" [{', '.join(extra_bits)}]" if extra_bits else ""
+        bits.append("courtesy, no charge")
+    tail = f" [{', '.join(bits)}]" if bits else ""
     out(f"#{rid} {label}: {a.request}{tail}" + (f" -> {money(cost, led['currency'])} ({how})" if cost is not None else ""))
     if not agr["version"]:
         out("Note: no agreement is saved yet, so this verdict isn't tied to an agreement version.")
@@ -465,87 +696,147 @@ def cmd_log(a, st: Store) -> int:
 def cmd_update(a, st: Store) -> int:
     led = st.load(a.client, a.project)
     r = find(led, a.id)
+    changes = []
+    if a.verdict:
+        if a.verdict not in VERDICTS:
+            fail(f"--verdict must be one of {', '.join(VERDICTS)}.")
+        if a.verdict == "revision":
+            fail("To record a revision, log it after a round. --verdict on update is for settling grey areas "
+                 "(grey -> extra or included) or correcting a verdict.")
+        if not a.reason:
+            fail("Say why the verdict changes with --reason (e.g. 'client confirmed social sizes weren't included').")
+        if r.get("change_order") or r.get("absorbed_in") or r.get("invoice") in INVOICED:
+            fail(f"#{r['id']} is already on a change order, in an amendment, or invoiced; its verdict can't change now.")
+        old = r["verdict"]
+        r["verdict"] = a.verdict
+        if a.verdict in ("extra", "grey") and r["quote"] == "n/a" and not r.get("complimentary"):
+            r["quote"], r["invoice"] = "draft", "not_invoiced"
+        if a.verdict == "included":
+            r["quote"], r["invoice"], r["cost"], r["priced_as"] = "n/a", "n/a", None, "covered by the agreement"
+        r["note"] = (r.get("note", "") + f" Reclassified {old} -> {a.verdict}: {a.reason}").strip()
+        changes.append(f"verdict {old} -> {a.verdict} ({a.reason})")
     if a.status:
         if a.status not in OLD_STATUS:
             fail(f"--status must be one of {', '.join(OLD_STATUS)} (or use --quote/--work/--invoice).")
         for k, v in OLD_STATUS[a.status].items():
             r[k] = v
+        changes.append(f"status {a.status}")
     for field, value, allowed in (("quote", a.quote, QUOTE), ("work", a.work, WORK), ("invoice", a.invoice, INVOICE)):
         if value is not None:
             if value not in allowed:
                 fail(f"--{field} must be one of {', '.join(allowed)}.")
             r[field] = value
+            changes.append(f"{field} {value}")
     if a.courtesy is not None:
         r["complimentary"] = a.courtesy
         if a.courtesy:
+            if r.get("invoice") in INVOICED:
+                fail("This item is already invoiced, so it can't become a courtesy.")
             r["quote"], r["invoice"] = "n/a", "n/a"
-    if r.get("invoice") in ("invoiced", "partially_paid", "paid", "overdue") and r.get("quote") != "accepted":
-        fail("Only accepted work can be invoiced. Set --quote accepted first (and record who approved it).")
+        changes.append("courtesy" if a.courtesy else "no longer courtesy")
+    invoice_changing = a.invoice is not None or a.status is not None or a.verdict is not None
+    if r.get("invoice") in INVOICED and invoice_changing:
+        if r.get("complimentary") or not billable(r):
+            fail("Courtesy, included and in-limit revision work can't be invoiced.")
+        if r.get("quote") != "accepted":
+            fail("Only accepted work can be invoiced. Set --quote accepted first (and record who approved it).")
+        if r["verdict"] == "grey":
+            fail("This is still a grey area. Settle it first: update ID --verdict extra --reason \"...\".")
+        if r.get("work") != "done" and not a.advance:
+            fail("The work isn't marked done. Invoice after --work done, or add --advance for an agreed upfront invoice.")
     if a.approved_by or a.evidence:
         r["approval"] = {"by": a.approved_by or r.get("approval", {}).get("by", ""),
                          "evidence": a.evidence or r.get("approval", {}).get("evidence", ""), "date": today()}
-    if r.get("quote") == "accepted" and not r.get("approval"):
+        changes.append(f"approval {r['approval']['by']} ({r['approval']['evidence']})")
+    if r.get("quote") == "accepted" and not (r.get("approval") or {}).get("by"):
         out("Note: record how the client approved it (--approved-by, --evidence) so there's proof later.")
     if any(v is not None for v in (a.hours, a.days, a.fixed)):
+        if r.get("invoice") in INVOICED:
+            fail("This item is already invoiced; its price can't change. Log a correction as a new item instead.")
         cost, how = cost_of(led, a.hours, a.days, a.fixed, a.buffer)
         r["cost"], r["priced_as"] = str(cost), how
+        changes.append(f"price {money(cost, led['currency'])}")
     if a.note:
         r["note"] = a.note
+    if changes:
+        log_event(led, "request updated", f"#{r['id']}: " + "; ".join(changes))
     st.save(led)
     c = f" {money(Decimal(r['cost']), led['currency'])}" if r.get("cost") else ""
-    out(f"#{r['id']}{c}: quote {r['quote']}, work {r['work']}, invoice {r['invoice']}"
+    out(f"#{r['id']}{c}: {r['verdict']}, quote {r['quote']}, work {r['work']}, invoice {r['invoice']}"
         + (", courtesy" if r.get("complimentary") else "") + f": {r['request']}")
     return 0
 
 
 def cmd_change_order(a, st: Store) -> int:
     led = st.load(a.client, a.project)
+    if len(set(a.ids)) != len(a.ids):
+        fail("The same request is listed more than once.")
     items = [find(led, i) for i in a.ids]
-    bad = [f"#{r['id']}" for r in items if not billable(r) and not r.get("over_cap")]
-    if bad:
-        fail(f"{', '.join(bad)} aren't extra work, so they don't belong on a change order.")
-    unpriced = [f"#{r['id']}" for r in items if not r.get("cost")]
-    if unpriced:
-        fail(f"Price {', '.join(unpriced)} first (update ... --hours N or --fixed AMOUNT).")
+    problems = []
+    for r in items:
+        tag = f"#{r['id']}"
+        if r["verdict"] == "grey":
+            problems.append(f"{tag} is a grey area: settle it with the client first, then "
+                            f"`update {r['id']} --verdict extra --reason \"...\"`")
+        elif not is_extra(r):
+            problems.append(f"{tag} isn't extra work ({r['verdict']})")
+        elif r.get("complimentary"):
+            problems.append(f"{tag} is a courtesy, so it isn't charged")
+        elif r["quote"] in ("rejected", "expired"):
+            problems.append(f"{tag} was {r['quote']}; log it again if the client wants it now")
+        elif r.get("change_order"):
+            problems.append(f"{tag} is already on change order {r['change_order']}")
+        elif r.get("absorbed_in"):
+            problems.append(f"{tag} is already part of agreement v{r['absorbed_in']}")
+        elif r.get("invoice") in INVOICED:
+            problems.append(f"{tag} is already invoiced")
+        elif not r.get("cost"):
+            problems.append(f"{tag} has no price yet (update {r['id']} --hours N or --fixed AMOUNT)")
+    if problems:
+        fail("Can't make this change order: " + "; ".join(problems) + ".")
     cur = led["currency"]
     agr = current_agreement(led)
-    number = len(led.get("change_orders", [])) + 1
-    total = sum(Decimal(r["cost"]) for r in items)
-    lines = [f"# Change order {number}: {led['project']}", "",
-             f"- **Client:** {led['client']}",
+    number = len(led["change_orders"]) + 1
+    total = sum((Decimal(r["cost"]) for r in items), Decimal(0))
+    lines = [f"# Change order {number}: {md(led['project'])}", "",
+             f"- **Client:** {md(led['client'])}",
              f"- **Date:** {today()}",
-             f"- **Based on:** agreement version {agr['version']}" + (f", {agr['source']}" if agr.get("source") else ""),
-             "", "| # | Additional work | Why it's outside the agreement | Price |", "|---|---|---|---|"]
+             f"- **Based on:** agreement version {agr['version']}" + (f", {md(agr['source'])}" if agr.get("source") else ""),
+             "", "| # | Additional work | Why it's outside the agreement | Price | Approval |", "|---|---|---|---|---|"]
     for r in items:
-        why = (r.get("clause") or "Not covered by the agreement").replace("|", "/")
-        lines.append(f"| {r['id']} | {r['request'].replace('|', '/')} | {why} | {money(Decimal(r['cost']), cur)} |")
+        why = md(r.get("clause") or "Not covered by the agreement")
+        lines.append(f"| {r['id']} | {md(r['request'])} | {why} | {money(Decimal(r['cost']), cur)} | {approval_text(r)} |")
     lines += ["", f"**Total:** {money(total, cur)}"]
     if a.timeline:
-        lines.append(f"**Timeline impact:** {a.timeline}")
+        lines.append(f"**Timeline impact:** {md(a.timeline)}")
     if agr.get("price"):
         others = sum((Decimal(r["cost"]) for r in led["requests"]
                       if billable(r) and r["quote"] == "accepted" and not r.get("absorbed_in")
                       and r.get("cost") and r["id"] not in a.ids), Decimal(0))
-        on_top = sum((Decimal(r["cost"]) for r in items if not r.get("absorbed_in")), Decimal(0))
-        lines.append(f"**Project total with these items:** {money(Decimal(agr['price']) + others + on_top, cur)}")
-    approved = [r for r in items if r["quote"] == "accepted" and r.get("approval", {}).get("by")]
+        lines.append(f"**Project total with these items:** {money(Decimal(agr['price']) + others + total, cur)}")
+    approved = [r for r in items if r["quote"] == "accepted" and (r.get("approval") or {}).get("by")]
+    lines += ["", "Everything else in the agreement stays the same."]
     if len(approved) == len(items):
-        ap = items[0]["approval"]
-        lines += ["", "Everything else in the agreement stays the same.", "",
-                  f"**Approved by:** {ap.get('by')}   **Date:** {ap.get('date', '')}"
-                  + (f"   **Evidence:** {ap['evidence']}" if ap.get("evidence") else ""), ""]
+        lines += ["", "Each item above was approved individually, as shown in the Approval column.", ""]
     else:
-        lines += ["", "Work on these items starts once this change order is approved. "
-                  "Everything else in the agreement stays the same.",
-                  "", "**Approved by:** ______________________   **Date:** ____________", ""]
+        pending = [f"#{r['id']}" for r in items if r not in approved]
+        lines += [f"Work on {', '.join(pending)} starts once approved below.", "",
+                  f"**Approval of {', '.join(pending)}:** ______________________   **Date:** ____________", ""]
     text = "\n".join(lines)
-    led.setdefault("change_orders", []).append({"number": number, "date": today(), "items": a.ids, "total": str(total)})
+    if a.out:  # write the document first: if that fails, the record stays unchanged
+        try:
+            Path(a.out).write_text(text, encoding="utf-8")
+        except OSError as e:
+            fail(f"Couldn't write {a.out} ({e.strerror}). Nothing was recorded.")
+    led["change_orders"].append({"number": number, "date": today(), "items": list(a.ids), "total": str(total),
+                                 "agreement_version": agr["version"]})
     for r in items:
+        r["change_order"] = number
         if r["quote"] == "draft":
             r["quote"] = "sent"
+    log_event(led, "change order", f"CO {number}: {', '.join('#' + str(i) for i in a.ids)}, {money(total, cur)}")
     st.save(led)
     if a.out:
-        Path(a.out).write_text(text, encoding="utf-8")
         out(f"Change order saved to {a.out}")
     out(text)
     return 0
@@ -557,19 +848,21 @@ def build_report(led: dict) -> str:
     m, c = t["money"], t["counts"]
     agr = current_agreement(led)
     price = Decimal(agr["price"]) if agr.get("price") else None
-    lines = [f"# Scope report: {led['client']} / {led['project']}", ""]
+    lines = [f"# Scope report: {md(led['client'])} / {md(led['project'])}", ""]
     lines.append(f"- Rate: {money(Decimal(led['rate']), cur)}/{led['rate_unit']}"
                  + (f" | Agreed price (v{agr['version']}): {money(price, cur)}" if price is not None else ""))
-    cap, used = agr.get("revisions_included"), len(led["rounds"])
-    lines.append(f"- Revision rounds: {used}" + (f" of {cap} included" if cap is not None else " (no limit agreed)")
-                 + (f" - **{used - cap} over the limit**" if cap is not None and used > cap else ""))
+    used = len(led["rounds"])
+    last_cap = led["rounds"][-1].get("cap") if led["rounds"] else agr.get("revisions_included")
+    over = sum(1 for r in led["rounds"] if r.get("cap") is not None and r["round"] > r["cap"])
+    lines.append(f"- Revision rounds: {used}" + (f" of {last_cap} included" if last_cap is not None else " (no limit agreed)")
+                 + (f" - **{over} over the limit**" if over else ""))
     if led["agreement"]:
         lines += ["", "## Agreement history", "", "| Version | Effective | Note | Approved by | Price | Rounds |",
                   "|---|---|---|---|---|---|"]
         for v in led["agreement"]:
             pv = money(Decimal(v["price"]), cur) if v.get("price") else "-"
-            lines.append(f"| {v['version']} | {v.get('effective', '')} | {v.get('note', '')} | "
-                         f"{v.get('approved_by') or '-'} | {pv} | {v.get('revisions_included', '-')} |")
+            lines.append(f"| {v['version']} | {md(v.get('effective', ''))} | {md(v.get('note', ''))} | "
+                         f"{md(v.get('approved_by')) or '-'} | {pv} | {v.get('revisions_included', '-')} |")
     lines += ["", "## Extra work", "", "| | Items | Value |", "|---|---|---|"]
     for b, label in (("accepted", "Accepted by the client (billable)"), ("sent", "Quoted, waiting for an answer"),
                      ("draft", "Priced, not sent to the client yet"), ("grey_open", "Grey areas, still to clarify"),
@@ -585,20 +878,23 @@ def build_report(led: dict) -> str:
         lines.append(f"\n**Project total:** {money(price + m['accepted_on_top'], cur)} "
                      f"(agreed v{agr['version']} {money(price, cur)} + accepted extras {money(m['accepted_on_top'], cur)}"
                      + (f"; {money(absorbed, cur)} of accepted extras is already inside the amended price" if absorbed else "")
-                     + ")")
+                     + "). Run `explain` for the item-by-item calculation.")
     if m["complimentary"] > 0:
         pct = f" ({(m['complimentary'] / price * 100).quantize(Decimal('1'))}% of the agreed price)" if price else ""
         lines.append(f"\n**Given away so far:** {money(m['complimentary'], cur)}{pct}.")
-    lines += ["", "## Change log", "", "| # | Date | Request | Verdict | Agreement | Quote | Work | Invoice | Value | Based on |",
+    lines += ["", "## Change log", "",
+              "| # | Date | Request | Verdict | Agreement | Quote | Work | Invoice | Value | Based on |",
               "|---|---|---|---|---|---|---|---|---|---|"]
     for r in led["requests"]:
         val = money(Decimal(r["cost"]), cur) if r.get("cost") else "-"
         verdict = r["verdict"] + (f" (round {r['round']}{', over limit' if r.get('over_cap') else ''})" if r.get("round") else "")
         if r.get("complimentary"):
             verdict += ", courtesy"
-        clause = (r.get("clause") or "-").replace("|", "/")
+        if r.get("change_order"):
+            verdict += f", CO {r['change_order']}"
+        clause = md(r.get("clause") or "-")
         clause = clause if len(clause) <= 70 else clause[:67] + "..."
-        lines.append(f"| {r['id']} | {r['date'][:10]} | {r['request'].replace('|', '/')} | {verdict} | "
+        lines.append(f"| {r['id']} | {r['date'][:10]} | {md(r['request'])} | {verdict} | "
                      f"v{r.get('agreement_version', '-')} | {r['quote']} | {r['work']} | {r['invoice']} | {val} | {clause} |")
     return "\n".join(lines) + "\n"
 
@@ -606,9 +902,61 @@ def build_report(led: dict) -> str:
 def cmd_report(a, st: Store) -> int:
     text = build_report(st.load(a.client, a.project))
     if a.out:
-        Path(a.out).write_text(text, encoding="utf-8")
+        try:
+            Path(a.out).write_text(text, encoding="utf-8")
+        except OSError as e:
+            fail(f"Couldn't write {a.out} ({e.strerror}).")
         out(f"Report saved to {a.out}")
     out(text)
+    return 0
+
+
+def cmd_explain(a, st: Store) -> int:
+    """Show exactly how each total is built from the recorded items."""
+    led = st.load(a.client, a.project)
+    cur = led["currency"]
+    agr = current_agreement(led)
+    zero = Decimal(0)
+    out(f"How the totals for {led['client']} / {led['project']} are calculated")
+    out("")
+    price = Decimal(agr["price"]) if agr.get("price") else None
+    out(f"Agreed price: {money(price, cur) if price is not None else 'not recorded'} (agreement v{agr['version']}"
+        + (f", {agr.get('note')}" if agr.get("note") else "") + ")")
+    on_top = [r for r in led["requests"] if billable(r) and r["quote"] == "accepted" and not r.get("absorbed_in") and r.get("cost")]
+    absorbed = [r for r in led["requests"] if r.get("absorbed_in")]
+    for r in on_top:
+        out(f"  + #{r['id']} {r['request']}: {money(Decimal(r['cost']), cur)} ({r.get('priced_as', '')}; approved by "
+            f"{(r.get('approval') or {}).get('by') or 'not recorded'})")
+    for r in absorbed:
+        out(f"  (#{r['id']} {r['request']} is already inside the v{r['absorbed_in']} price, not added again)")
+    total = (price or zero) + sum((Decimal(r["cost"]) for r in on_top), zero)
+    out(f"  = Project total: {money(total, cur)}")
+    out("")
+    paid = [r for r in on_top + absorbed if r.get("invoice") == "paid"]
+    billed = [r for r in on_top + absorbed if r.get("invoice") in ("invoiced", "partially_paid", "overdue")]
+    unbilled = [r for r in on_top if r.get("invoice") in ("not_invoiced",)]
+    for label, rows in (("Paid", paid), ("Invoiced, not fully paid", billed), ("Accepted, not invoiced yet", unbilled)):
+        s = sum((Decimal(r["cost"]) for r in rows if r.get("cost")), zero)
+        out(f"{label}: {money(s, cur)}" + (f"  ({', '.join('#' + str(r['id']) for r in rows)})" if rows else ""))
+    free = [r for r in led["requests"] if r.get("complimentary") and r.get("cost")]
+    if free:
+        s = sum((Decimal(r["cost"]) for r in free), zero)
+        out(f"Given away as courtesy: {money(s, cur)}  ({', '.join('#' + str(r['id']) for r in free)})")
+    left_out = [r for r in led["requests"] if r["verdict"] in ("extra", "grey") and not r.get("complimentary")
+                and r["quote"] != "accepted"]
+    if left_out:
+        out("Not counted in the total (not accepted): "
+            + ", ".join(f"#{r['id']} ({r['verdict']}, {r['quote']})" for r in left_out))
+    return 0
+
+
+def cmd_history(a, st: Store) -> int:
+    led = st.load(a.client, a.project)
+    out(f"History for {led['client']} / {led['project']}")
+    for e in led.get("events", []):
+        out(f"{e['at'].replace('T', ' ')}  {e['event']}: {e['detail']}")
+    if not led.get("events"):
+        out("No events recorded yet.")
     return 0
 
 
@@ -620,13 +968,14 @@ def cmd_list(a, st: Store) -> int:
         return 0
     for f in files:
         try:
-            led = json.loads(f.read_text(encoding="utf-8"))
+            led = upgrade_v2(json.loads(f.read_text(encoding="utf-8")))
+            validate(led, str(f))
             t = totals(led)
             cur = led["currency"]
             out(f"{led['client']} / {led['project']}: {len(led['requests'])} request(s) | accepted "
                 f"{money(t['money']['accepted'], cur)} | waiting {money(t['money']['sent'], cur)} | "
                 f"given away {money(t['money']['complimentary'], cur)}")
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, SystemExit):
             out(f"{f}: damaged, see `restore`")
     for f in legacy:
         out(f"{f.stem}: old-format record, upgraded automatically the next time it's used")
@@ -636,12 +985,27 @@ def cmd_list(a, st: Store) -> int:
 def cmd_restore(a, st: Store) -> int:
     p = st.path(a.client, a.project)
     bak = p.with_suffix(".json.bak")
-    if not bak.is_file():
-        fail(f"No backup found at {bak}.")
-    json.loads(bak.read_text(encoding="utf-8"))  # make sure the backup itself is readable
-    if p.is_file():
-        shutil.copy2(p, p.with_name(f"{p.stem}.damaged-{dt.datetime.now():%Y%m%d-%H%M%S}.json.bak"))
-    shutil.copy2(bak, p)
+    with Lock(p):
+        if not bak.is_file():
+            fail(f"No backup found at {bak}.")
+        try:
+            restored = json.loads(bak.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            fail(f"The backup {bak} is damaged too. Check the *.reset-*/*.damaged-* copies in {p.parent}.")
+        restored = upgrade_v2(restored) if restored.get("schema") == SCHEMA else migrate_v1(restored, a.project)
+        validate(restored, str(bak))
+        current_rev = 0
+        if p.is_file():
+            try:
+                current_rev = int(json.loads(p.read_text(encoding="utf-8")).get("rev", 0))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                current_rev = 0
+            shutil.copy2(p, p.with_name(f"{p.stem}.damaged-{dt.datetime.now():%Y%m%d-%H%M%S}.json.bak"))
+        # A higher revision than anything in flight, so a command that loaded the old state can't overwrite this.
+        restored["rev"] = max(current_rev, int(restored.get("rev", 0))) + 1
+        restored["updated"] = now()
+        log_event(restored, "restored", "went back to the state before the last change")
+        atomic_write(p, restored)
     out(f"Restored {p} from the last good copy (the replaced file was kept alongside it).")
     return 0
 
@@ -650,7 +1014,7 @@ def cmd_quote(a, st: Store) -> int:
     if a.hours is None and a.days is None:
         fail("Give --hours or --days.")
     led = {"rate": str(dec(a.rate, "--rate")), "rate_unit": a.unit, "currency": a.currency.upper(),
-           "hours_per_day": a.hours_per_day}
+           "hours_per_day": hours_per_day(a.hours_per_day)}
     cost, how = cost_of(led, a.hours, a.days, None, a.buffer)
     out(f"{money(cost, led['currency'])}  ({how})")
     return 0
@@ -682,8 +1046,8 @@ def main(argv=None) -> int:
     p.add_argument("--unit", default="hour", choices=UNITS)
     p.add_argument("--currency", default="USD")
     p.add_argument("--price")
-    p.add_argument("--revisions", type=int)
-    p.add_argument("--hours-per-day", type=float, default=8)
+    p.add_argument("--revisions")
+    p.add_argument("--hours-per-day", default="8")
     p.add_argument("--force", action="store_true", help="start over (the old record is backed up first)")
     for name in ("agreement", "baseline"):
         p = sub.add_parser(name)
@@ -703,14 +1067,17 @@ def main(argv=None) -> int:
     p.add_argument("--clause")
     p.add_argument("--note")
     p.add_argument("--courtesy", action="store_true", help="the user chooses to do this extra for free")
-    p.add_argument("--allow-over-cap", action="store_true", help="record an over-limit revision as-is")
+    p.add_argument("--allow-over-cap", action="store_true", help="record an over-limit revision as chargeable")
     priced(p)
     p = sub.add_parser("update")
     client(p)
     p.add_argument("id", type=int)
+    p.add_argument("--verdict", help="settle a grey area or correct a verdict (needs --reason)")
+    p.add_argument("--reason")
     p.add_argument("--quote")
     p.add_argument("--work")
     p.add_argument("--invoice")
+    p.add_argument("--advance", action="store_true", help="allow invoicing before the work is done (agreed upfront)")
     p.add_argument("--status", help="shortcut: pending, approved, free, declined, done")
     cg = p.add_mutually_exclusive_group()
     cg.add_argument("--courtesy", dest="courtesy", action="store_true", default=None)
@@ -727,9 +1094,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("report")
     client(p)
     p.add_argument("--out")
+    for name in ("explain", "history", "restore"):
+        client(sub.add_parser(name))
     sub.add_parser("list")
-    p = sub.add_parser("restore")
-    client(p)
     p = sub.add_parser("quote")
     p.add_argument("--rate", required=True)
     p.add_argument("--unit", default="hour", choices=UNITS)
@@ -737,13 +1104,14 @@ def main(argv=None) -> int:
     p.add_argument("--hours")
     p.add_argument("--days")
     p.add_argument("--buffer")
-    p.add_argument("--hours-per-day", type=float, default=8)
+    p.add_argument("--hours-per-day", default="8")
 
     a = ap.parse_args(argv)
     st = Store(a.data_dir)
     handlers = {"init": cmd_init, "agreement": cmd_agreement, "baseline": cmd_agreement, "round": cmd_round,
                 "log": cmd_log, "update": cmd_update, "change-order": cmd_change_order, "report": cmd_report,
-                "list": cmd_list, "restore": cmd_restore, "quote": cmd_quote}
+                "explain": cmd_explain, "history": cmd_history, "list": cmd_list, "restore": cmd_restore,
+                "quote": cmd_quote}
     return handlers[a.cmd](a, st)
 
 

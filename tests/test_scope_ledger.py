@@ -109,7 +109,7 @@ class Agreements(Base):
         self.run_cmd("update", "Bloom", "1", "--quote", "accepted", "--approved-by", "Priya", "--evidence", "WhatsApp")
         co = self.run_cmd("change-order", "Bloom", "1")
         self.assertIn("Project total with these items:** $750", co)
-        self.assertIn("**Approved by:** Priya", co)
+        self.assertIn("| Priya, ", co)
         self.assertNotIn("______", co)
         f = Path(self.d) / "amend.json"
         f.write_text(json.dumps({"deliverables": ["3 concepts", "Cake box"], "price": 750}))
@@ -181,12 +181,12 @@ class ChangeOrders(Base):
         self.run_cmd("init", "Bloom", "--rate", "50", "--price", "600")
         self.run_cmd("log", "Bloom", "--request", "Box", "--verdict", "extra", "--clause", "Not included: packaging", "--hours", "3")
         self.run_cmd("log", "Bloom", "--request", "Fix e", "--verdict", "included")
-        self.assertIn("aren't extra work", self.fails("change-order", "Bloom", "2"))
+        self.assertIn("isn't extra work", self.fails("change-order", "Bloom", "2"))
         out = self.run_cmd("change-order", "Bloom", "1", "--timeline", "+2 working days")
         self.assertIn("Change order 1", out)
         self.assertIn("Total:** $150", out)
         self.assertIn("Project total with these items:** $750", out)
-        self.assertIn("Approved by:", out)
+        self.assertIn("**Approval of #1:**", out)
         self.assertEqual(self.rec()["requests"][0]["quote"], "sent")
 
 
