@@ -1,0 +1,127 @@
+{
+  "about": "Hand-checked classification cases for ScopeGuard. Each case gives an agreement, a client message and the expected verdict for every request. 'traps' are mistakes that would cost the freelancer a client (false extras) or money (missed extras). Case 01 is the acceptance test used in the README.",
+  "cases": [
+    {
+      "id": "01-logo-acceptance",
+      "profession": "graphic design",
+      "rate": "50/hour",
+      "agreement": "examples/logo-project/proposal.md",
+      "message": "examples/logo-project/client-message.txt",
+      "expected": [
+        {"request": "Softer pink", "verdict": "revision", "round": 1},
+        {"request": "Instagram profile pic + Facebook cover", "verdict": "grey"},
+        {"request": "Concept B with concept A's font", "verdict": "revision", "round": 1},
+        {"request": "Logo on cake boxes", "verdict": "extra", "evidence": "Not included: packaging design"},
+        {"request": "Squished e at small sizes", "verdict": "included"}
+      ],
+      "traps": ["Counting the two revisions as two rounds", "Charging for the 'e' fix", "Calling social sizes extra when the proposal is silent"]
+    },
+    {
+      "id": "02-web-pages-over-count",
+      "profession": "web development",
+      "agreement": "5-page marketing site (Home, About, Services, Blog index, Contact). 2 revision rounds. Content supplied by client. $3,000.",
+      "message": "Can we add a Pricing page? Also the contact form isn't sending emails on mobile.",
+      "expected": [
+        {"request": "Pricing page", "verdict": "extra", "evidence": "5-page marketing site"},
+        {"request": "Contact form broken on mobile", "verdict": "included"}
+      ],
+      "traps": ["Charging for a bug in the developer's own work"]
+    },
+    {
+      "id": "03-video-new-ratio",
+      "profession": "video editing",
+      "agreement": "One 90-second promo video, 16:9, 2 revision rounds, licensed music included.",
+      "message": "Love it! Could you make the logo animation faster and also export a 9:16 version for Reels?",
+      "expected": [
+        {"request": "Faster logo animation", "verdict": "revision", "round": 1},
+        {"request": "9:16 version", "verdict": "extra", "evidence": "One 90-second promo video, 16:9"}
+      ],
+      "traps": ["Treating a new aspect ratio as a revision"]
+    },
+    {
+      "id": "04-silent-agreement",
+      "profession": "copywriting",
+      "agreement": "Website copy for 4 pages, up to 600 words each. 1 round of edits.",
+      "message": "Can you also write the meta descriptions for each page?",
+      "expected": [{"request": "Meta descriptions", "verdict": "grey"}],
+      "traps": ["Calling it extra without asking: the agreement neither includes nor excludes meta descriptions"]
+    },
+    {
+      "id": "05-cap-exceeded",
+      "profession": "graphic design",
+      "agreement": "Poster design, 2 revision rounds.",
+      "history": "Two rounds of feedback already done.",
+      "message": "Last thing, promise! Can the date be bigger and the background lighter?",
+      "expected": [
+        {"request": "Bigger date", "verdict": "extra", "note": "round 3 of 2: beyond the cap"},
+        {"request": "Lighter background", "verdict": "extra", "note": "same round 3"}
+      ],
+      "traps": ["Logging as normal revisions", "Counting them as two rounds"]
+    },
+    {
+      "id": "06-reversing-locked-decision",
+      "profession": "brand design",
+      "agreement": "3 concepts; once a concept is chosen it's locked, then 2 revision rounds on it.",
+      "history": "Client chose concept B in writing on 10 Nov.",
+      "message": "Actually, can we go back to concept A instead?",
+      "expected": [{"request": "Switch to concept A", "verdict": "extra", "evidence": "once a concept is chosen it's locked"}],
+      "traps": ["Treating a switch back to a rejected concept as a revision"]
+    },
+    {
+      "id": "07-clearly-included",
+      "profession": "social media",
+      "agreement": "12 Instagram posts per month including captions and hashtags, scheduled in Later.",
+      "message": "Can you add hashtags to next week's posts and schedule them for 6pm?",
+      "expected": [
+        {"request": "Hashtags", "verdict": "included"},
+        {"request": "Schedule for 6pm", "verdict": "included"}
+      ],
+      "traps": ["Any extra verdict here is a false extra"]
+    },
+    {
+      "id": "08-ugc-usage-rights",
+      "profession": "UGC creator",
+      "agreement": "2 UGC videos, organic use on the brand's own channels for 3 months.",
+      "message": "These are great, we'd like to run them as paid ads for the next 6 months.",
+      "expected": [{"request": "Paid ads use for 6 months", "verdict": "extra", "evidence": "organic use on the brand's own channels for 3 months"}],
+      "traps": ["Missing that paid-ads rights and a longer period are both outside the agreement"]
+    },
+    {
+      "id": "09-client-caused-rework",
+      "profession": "web development",
+      "agreement": "Client provides final copy by 1 Dec. Copy changes after build start are billed hourly.",
+      "history": "Pages were built with the final copy supplied on 1 Dec.",
+      "message": "We rewrote the About page text, can you swap it in and adjust the layout to fit?",
+      "expected": [{"request": "Swap rewritten copy and re-layout", "verdict": "extra", "evidence": "Copy changes after build start are billed hourly"}],
+      "traps": []
+    },
+    {
+      "id": "10-no-written-agreement",
+      "profession": "photography",
+      "agreement": "None written. The user says: 'we agreed on WhatsApp: 2 hours, 30 edited photos, $400'.",
+      "message": "Can we get all the RAW files too?",
+      "expected": [{"request": "RAW files", "verdict": "grey", "note": "nothing written; provisional, ask"}],
+      "traps": ["Stating a firm verdict without flagging that the agreement is unwritten"]
+    },
+    {
+      "id": "11-amendment-applies",
+      "profession": "graphic design",
+      "agreement": "Version 1: 3 concepts, 2 rounds, no packaging. Version 2 (approved 5 Dec by email): adds cake-box design for $150.",
+      "message": "Can you tweak the box colour to match the logo pink?",
+      "expected": [{"request": "Box colour tweak", "verdict": "revision", "note": "judged against version 2, where the box is in scope"}],
+      "traps": ["Judging against version 1 and calling it extra"]
+    },
+    {
+      "id": "12-mixed-bag-retainer",
+      "profession": "consulting",
+      "agreement": "Monthly retainer: 2 strategy calls (60 min) and email support Mon-Fri. No implementation work.",
+      "message": "Can we add a third call this month, and can you set up the HubSpot workflows we discussed? Also quick question on pricing tiers by email.",
+      "expected": [
+        {"request": "Third call", "verdict": "extra", "evidence": "2 strategy calls"},
+        {"request": "Set up HubSpot workflows", "verdict": "extra", "evidence": "No implementation work"},
+        {"request": "Pricing question by email", "verdict": "included", "evidence": "email support Mon-Fri"}
+      ],
+      "traps": ["Charging for the email question"]
+    }
+  ]
+}
