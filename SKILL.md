@@ -10,20 +10,31 @@ ScopeGuard makes the boundary visible: what was agreed, what is new, what it cos
 without damaging the relationship.
 
 The judgement (reading agreements, classifying requests, writing replies) is yours. The money math
-and the record keeping go through `scripts/scope_ledger.py` so totals are exact and the history
-survives between conversations. Paths are relative to this skill's folder; run the script from the
-user's working folder so their records land in `./scopeguard-data/`.
+and the record keeping go through `scripts/scope_ledger.py`, so totals are exact and the history
+survives between conversations.
+
+**Running the script:** call it by its full path inside this skill's folder (the folder you were
+given when this skill loaded), for example
+`python "C:/Users/me/.claude/skills/scopeguard/scripts/scope_ledger.py" report "Bloom"`.
+Run it *from the user's working folder* so their records land in `./scopeguard-data/` there, not
+inside the skill. Below, `SG` stands for that full command.
+
+Every record is one **client + project** (`--project NAME`, default `main`), so a client with two
+jobs has two independent agreements, round counters and totals. Always pass `--project` when the
+client has more than one.
 
 | Command | Use it to |
 |---|---|
-| `init CLIENT --rate 60 [--unit hour\|day] [--currency USD] [--price 1500] [--revisions 2] [--project NAME]` | Start a client record |
-| `baseline CLIENT --file baseline.json` | Save the agreed scope you extracted |
-| `log CLIENT --request "..." --verdict extra --clause "..." --hours 3 [--buffer 15]` | Record a request with its verdict and price |
-| `update CLIENT ID --status approved\|free\|declined\|done\|pending` | Record what happened next |
-| `round CLIENT` | Count a revision round and compare it with the cap |
-| `report CLIENT [--out report.md]` | Totals, new project total, money given away, change log |
-| `quote --rate 60 --hours 3 [--buffer 15]` | One-off price without a record |
-| `list` | All clients at a glance |
+| `SG init CLIENT --project P --rate 60 [--unit hour\|day] [--currency USD]` | Start a project record |
+| `SG agreement CLIENT --project P --file scope.json` | Save the original agreement (version 1) |
+| `SG agreement ... --file new.json --note "Added box" --approved-by NAME --evidence "email 3 Dec" [--absorbs ID]` | Add an amendment as a new version (old versions are never changed) |
+| `SG round CLIENT --project P` | Record one batch of client feedback (a revision round) |
+| `SG log CLIENT --project P --request "..." --verdict extra --clause "..." --hours 3 [--buffer 15] [--courtesy]` | Record a request, its verdict, evidence and price |
+| `SG update CLIENT ID --quote sent\|accepted\|rejected\|expired --work in_progress\|done --invoice invoiced\|paid\|overdue --approved-by NAME --evidence "..."` | Record what happened next |
+| `SG change-order CLIENT ID [ID ...] --timeline "+2 days" --out co-1.md` | A formal change order for accepted or proposed extras |
+| `SG report CLIENT --project P [--out report.md]` | Agreement history, rounds, money by state, change log |
+| `SG list` / `SG restore CLIENT --project P` | All projects at a glance / recover from the last good copy |
+| `SG quote --rate 60 --hours 3` | One-off price without a record |
 
 ## Pick the mode
 
@@ -52,7 +63,7 @@ Extract:
   profession (see `references/professions.md`). These become grey areas later, so list them now.
 
 Show the baseline back as a compact table and ask the user to confirm or correct it once. A wrong
-baseline makes every later verdict wrong. Then save it:
+baseline makes every later verdict wrong. Then save it with `SG agreement` as version 1:
 
 ```json
 {
@@ -70,9 +81,25 @@ baseline makes every later verdict wrong. Then save it:
 }
 ```
 
-If there's no record yet, `init` it first (price and revision cap can go in either `init` or the
-baseline file; the baseline wins). Ask for the user's rate if you don't know it. Never invent
-a rate: a made-up number in a client message is worse than none.
+If there's no record yet, `init` it first. Ask for the user's rate if you don't know it. Never
+invent a rate: a made-up number in a client message is worse than none. Without a rate, show the
+hour estimates and leave prices blank.
+
+**When the scope changes later** (the client approves an extra that becomes part of the project, or
+both sides agree new terms), save the new terms with `SG agreement ... --note` as an amendment and
+record who approved it and where (`--approved-by`, `--evidence`). Never edit or replace the original;
+the history of what was agreed, and when, is what protects the user in a dispute. Each logged
+request remembers which agreement version it was judged against.
+
+- The amendment file only needs **what changed**; anything it leaves out carries over from the
+  previous version (deliverables, exclusions, rounds…). If a list changes, give the whole new list.
+- `price` in an amendment is the **new total** for the project.
+- If that new total already includes extras the client accepted earlier, add `--absorbs ID ...`
+  so they aren't counted twice. The script warns when the price changes while accepted extras are
+  still counted on top. Usually it's simpler to keep accepted extras as extras and only amend the
+  agreement when the deliverables themselves change.
+- New deliverables share the agreement's revision rounds unless the amendment says otherwise; say
+  so in the reply if it matters.
 
 ## 2. Classify every request
 
@@ -100,18 +127,23 @@ Rules that keep this fair:
 - **Revision vs new:** changing something that exists and was agreed is a revision; adding,
   replacing, or reversing something approved is new work.
 - **Counting rounds:** one batch of feedback is one round, however many revision items it holds.
-  Run `round` once per client message that contains revisions (before logging them, so each
-  revision is tagged with its round), unless the agreement defines a round differently. If the
+  Run `round` once per client message that contains revisions, *before* logging them, so each
+  revision is tagged with its round (the script refuses a revision when no round is recorded),
+  unless the agreement defines a round differently. If the
   agreement doesn't define a round, note that as a gap. Notes the client sends separately a day
   later may count as a new round; flag that to the user rather than deciding it silently.
 - **Fix or revision?** A defect in the user's own work (broken link, squished letter at small
   sizes, typo they introduced) is *included* and doesn't use up a round. A change of taste
   ("softer pink") is a revision.
-- When a revision round goes past the cap, treat the overflow as extra.
+- When a revision round goes past the cap, its changes are extra. The script enforces this: it
+  refuses `--verdict revision` beyond the cap, so log them as `extra` with a price, or with
+  `--courtesy` if the user decides to give that round for free.
 
 ## 3. Price the extra work
 
-For each extra (and each grey item the user wants priced), estimate the time with a one-line reason
+Price every extra. For grey items, give a price labelled "if extra" when the user is asking what to
+charge, so they know the stakes, and log it as `grey` (the report keeps it apart from real quotes).
+For each one, estimate the time with a one-line reason
 ("~3h: two new layouts plus export"). Build the estimate from the parts: setup and understanding the
 request, the actual work, one internal review, export/delivery, and client back-and-forth. Small
 asks rarely take under an hour once all of that is counted. If the user has done similar work
@@ -120,7 +152,7 @@ uncertain and use `--buffer 10`–`25` rather than a falsely precise number. The
 calculates the cost:
 
 ```bash
-python scripts/scope_ledger.py log "Acme" --request "Business card design" --verdict extra \
+SG log "Acme" --project "Brand identity" --request "Business card design" --verdict extra \
   --clause "Exclusions: business cards" --hours 2
 ```
 
@@ -129,7 +161,11 @@ when they can see the trade-off.
 
 ## 4. Draft the reply
 
-Write one message that covers every item, in the user's voice. Pick the tone from
+Write one message that covers every item, in the user's voice. If the user wants something more
+formal than a message (bigger extras, a new client, an agency), also generate a change order with
+`SG change-order`. Usually it's generated *before* approval: it's what the client signs, and it
+marks those quotes as sent. If the approval is already recorded, the change order fills in who
+approved it and where instead of blank sign-off lines, so it works as a confirmation too. Pick the tone from
 `references/reply-playbook.md` based on the relationship and the size of the ask. The core moves:
 
 - Open warmly and stay on the same side as the client ("Happy to help with this").
@@ -139,16 +175,27 @@ Write one message that covers every item, in the user's voice. Pick the tone fro
 - For grey items: one specific question, not an accusation.
 - For a revision cap reached: name the round number factually and offer the next round's price.
 - Small, loyal, first-time extras can be done as a named favour ("happy to include this one; it's
-  outside our scope, so just flagging it"). Log those as `free` so the record stays honest.
+  outside our scope, so just flagging it"). Log those with `--courtesy` (keep the price, so the
+  "given away" total stays honest).
 
 Never send anything yourself: drafts only. The user copies and sends.
 
 ## 5. Keep the record
 
-After the user decides or the client answers, update the status (`approved`, `free`, `declined`,
-`done`). Offer `report` when there are several items or the user asks how things stand. When the
-"given away" total gets meaningful, say so and offer a "let's regroup on scope" message from the
-playbook. That one message often recovers more money than any single quote.
+Each extra has three separate tracks, because an approved quote isn't money in the bank:
+
+| Track | Values |
+|---|---|
+| Quote | draft → sent → accepted / rejected / expired |
+| Work | not_started → in_progress → done |
+| Invoice | not_invoiced → invoiced → partially_paid / paid / overdue |
+
+Update them as things happen (`SG update`). When the client accepts, record who and where
+(`--approved-by`, `--evidence "WhatsApp 3 Dec 10:14"`) so there's proof later. Only accepted work can
+be invoiced. Offer `SG report` when there are several items or the user asks how things stand; it
+shows accepted extras not yet invoiced, which is often money the user forgot to bill. When the
+"given away" total gets meaningful, say so and offer the "let's regroup on scope" message from the
+playbook.
 
 ## Output format for a request check
 
@@ -185,5 +232,8 @@ Finish with the three fixes that matter most.
   local professional; the change log is useful evidence for them.
 - Don't invent clauses, quotes, or rates. If the agreement isn't available, verdicts are provisional,
   and say that in the reply notes.
-- Client records stay on the user's machine in `./scopeguard-data/`. Suggest adding that folder to
-  `.gitignore` if the working folder is a public repo, since it holds client names and prices.
+- The script makes no network requests and keeps records on the user's machine in
+  `./scopeguard-data/`. The documents the user shares with you are still processed by the AI
+  provider like any conversation, so for confidential contracts suggest removing details that
+  aren't needed (personal addresses, bank details) before pasting. Suggest adding
+  `scopeguard-data/` to `.gitignore` if the working folder is a public repo.

@@ -8,7 +8,7 @@ language. These are shapes to adapt, not scripts to paste.
 
 | Situation | Approach |
 |---|---|
-| Loyal client, first small extra | Do it as a named favour. Log it as `free`. |
+| Loyal client, first small extra | Do it as a named favour. Log it with `--courtesy` (keep the price, so the given-away total is honest). |
 | Any client, clear extra of real size | Quote it: what's involved, price, timeline impact, choice. |
 | Short, transactional job | Be direct: name the number in one line. |
 | Long project with many small extras piling up | Regroup: list what's included vs. new, total it, ask which to keep. |
