@@ -27,7 +27,8 @@ client has more than one.
 |---|---|
 | `SG init CLIENT --project P --rate 60 [--unit hour\|day] [--currency USD]` | Start a project record |
 | `SG agreement CLIENT --project P --file scope.json` | Save the original agreement (version 1) |
-| `SG agreement ... --file new.json --note "Added box" --approved-by NAME --evidence "email 3 Dec" [--absorbs ID]` | Add an amendment as a new version (old versions are never changed) |
+| `SG agreement ... --file new.json --note "Added box" --approved-by NAME --evidence "email 3 Dec" [--absorbs ID]` | Add an agreed amendment as a new version (old versions are never changed) |
+| `SG agreement ... --file new.json --note "Idea: 3 more rounds"` → later `SG agreement CLIENT --approve 2 --approved-by NAME --evidence "..."` | Save a *proposed* amendment, then record when the client agrees to it |
 | `SG round CLIENT --project P` | Record one batch of client feedback (a revision round) |
 | `SG log CLIENT --project P --request "..." --verdict extra --clause "..." --hours 3 [--buffer 15] [--courtesy]` | Record a request, its verdict, evidence and price |
 | `SG update CLIENT ID --quote sent\|accepted\|rejected\|expired --work in_progress\|done --invoice invoiced\|paid\|overdue --approved-by NAME --evidence "..."` | Record what happened next |
@@ -89,7 +90,10 @@ hour estimates and leave prices blank.
 
 **When the scope changes later** (the client approves an extra that becomes part of the project, or
 both sides agree new terms), save the new terms with `SG agreement ... --note` as an amendment and
-record who approved it and where (`--approved-by`, `--evidence`). Never edit or replace the original;
+record who approved it and where (`--approved-by`, `--evidence`). An amendment saved without them is
+only **proposed**: it's kept on record but changes no verdict, limit or total until
+`SG agreement CLIENT --approve N --approved-by NAME --evidence "..."`. Use that for anything still
+being negotiated. Never edit or replace the original;
 the history of what was agreed, and when, is what protects the user in a dispute. Each logged
 request remembers which agreement version it was judged against.
 
@@ -201,8 +205,13 @@ Each extra has three separate tracks, because an approved quote isn't money in t
 
 Update them as things happen (`SG update`). When the client accepts, record who and where
 (`--approved-by`, `--evidence "WhatsApp 3 Dec 10:14"`) so there's proof later. Only accepted,
-chargeable work that's done can be invoiced (`--advance` for an agreed upfront invoice), and an
-invoiced price can't change. Offer `SG report` when there are several items or the user asks how
+chargeable work that's done can be invoiced (`--advance` for an agreed upfront invoice). A grey item
+can't be marked accepted until it's settled, and included work never gets a quote. If the price of
+an accepted extra changes, the quote goes back to "sent" because the client agreed to the old
+number; use `--reapproved-by NAME` only if they've already agreed to the new one. Invoice states only
+move forward; fixing a mistake needs `--correction --reason "..."`, and once an item has been
+invoiced its price is frozen for good. `report` and `explain` list anything inconsistent under
+"Needs review" instead of quietly fixing it. Offer `SG report` when there are several items or the user asks how
 things stand; it shows accepted extras not yet invoiced, which is often money the user forgot to
 bill. When the user asks *why* a total is what it is, run `SG explain`: it lists every item that
 makes up the total. `SG history` shows the audit trail of everything recorded. When the

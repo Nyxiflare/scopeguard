@@ -17,6 +17,15 @@ Every finding has one label:
 
 ---
 
+## Status (v2.2, 2026-11-22)
+
+Fixed, each with a regression test in `tests/test_regressions_v22.py` that replays the reproduction above:
+F-01, F-02, F-03, F-04, F-05, F-06 (the top 5 ranked items) plus F-08, F-09 and F-10.
+Re-running the audit's probe script against v2.2 confirms every one of them is now refused or correct.
+
+Still open: F-07 (stale lock), F-11 (undoing a restore), F-12 (payment amounts), F-13 (evidence fields
+in SKILL.md), F-14 (export/diff), F-15 (failure-injection tests), F-16 (CI on 3 OSes), F-17 (README).
+
 ## Summary
 
 v2.1's record keeping is sound: atomic writes, version checks, locking, deep validation and 42 passing tests. The remaining risks fall in three places:

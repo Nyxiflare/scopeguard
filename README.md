@@ -34,6 +34,7 @@ Result for the [sample job](examples/logo-project/), using the $50/hour rate the
   - separate tracks for quote, work and invoice, so "accepted" never gets mistaken for "paid"
   - who approved each change, and where
   - an audit trail of every event (`history`)
+- **Guards the money:** grey areas can't be counted as revenue until settled, a changed price needs the client's OK again, invoices only move forward (corrections are logged), invoiced prices are frozen, amendments only take effect once the client agrees, and every stored amount is rounded the way your currency is, so line items always add up.
 - **Explains every number:** `explain` shows exactly which items make up the project total, what's paid, invoiced, not yet billed, and given away.
 - **Protects your records:** a backup before every change, `restore`, safety when two commands run at once, checks that catch a damaged or edited record, and correct decimal places for each currency.
 - **Checks proposals before you send them:** flags "unlimited revisions", "minor tweaks", "until satisfied", missing exclusions and missing change-request clauses, with replacement wording.
