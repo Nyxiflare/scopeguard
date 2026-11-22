@@ -89,7 +89,7 @@ class V21(Base):
     def amend(self, *extra):
         f = Path(self.d) / "amend.json"
         f.write_text(json.dumps({"deliverables": ["3 concepts", "Box"], "price": 750}))
-        return ["agreement", "Bloom", "--file", str(f), "--note", "Added box", *extra]
+        return ["agreement", "Bloom", "--file", str(f), "--note", "Added box", "--approved-by", "Priya", *extra]
 
     def test_draft_extra_cannot_be_absorbed_and_ledger_unchanged(self):
         self.setup_project()
@@ -203,8 +203,8 @@ class V21(Base):
         self.run_cmd("update", "Bloom", "1", "--quote", "accepted", "--approved-by", "Priya")
         self.assertIn("isn't marked done", self.fails("update", "Bloom", "1", "--invoice", "invoiced"))
         self.run_cmd("update", "Bloom", "1", "--invoice", "invoiced", "--advance")
-        self.assertIn("can't be invoiced", self.fails("update", "Bloom", "2", "--invoice", "invoiced"))
-        self.assertIn("price can't change", self.fails("update", "Bloom", "1", "--hours", "5"))
+        self.assertIn("has no quote or invoice", self.fails("update", "Bloom", "2", "--invoice", "invoiced"))
+        self.assertIn("price is frozen", self.fails("update", "Bloom", "1", "--hours", "5"))
 
     def test_currency_minor_units(self):
         self.assertIn("1,500.125 KWD", self.run_cmd("quote", "--rate", "500.0417", "--currency", "KWD", "--hours", "3"))

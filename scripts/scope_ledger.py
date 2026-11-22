@@ -47,6 +47,9 @@ QUOTE = ("draft", "sent", "accepted", "rejected", "expired", "n/a")
 WORK = ("not_started", "in_progress", "done")
 INVOICE = ("not_invoiced", "invoiced", "partially_paid", "paid", "overdue", "n/a")
 INVOICED = ("invoiced", "partially_paid", "paid", "overdue")
+# Invoice states only move forward; going back needs --correction.
+INVOICE_RANK = {"n/a": -1, "not_invoiced": 0, "invoiced": 1, "overdue": 2, "partially_paid": 2, "paid": 3}
+AGREEMENT_STATUS = ("agreed", "proposed")
 UNITS = ("hour", "day")
 SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "INR": "₹", "JPY": "¥", "AUD": "A$", "CAD": "C$",
            "KRW": "₩", "BRL": "R$", "MXN": "MX$", "SGD": "S$", "NZD": "NZ$", "PHP": "₱", "NGN": "₦"}
@@ -191,6 +194,10 @@ def validate(led: dict, where: str) -> None:
             p.append(f"agreement v{i} has an invalid revision limit")
         if not isinstance(v.get("scope", {}), dict):
             p.append(f"agreement v{i} scope is not an object")
+        if v.get("status", "agreed") not in AGREEMENT_STATUS:
+            p.append(f"agreement v{i} has an unknown status '{v.get('status')}'")
+        if i == 1 and v.get("status", "agreed") != "agreed":
+            p.append("agreement v1 (the original) must be agreed")
         versions.append(i)
     vset = set(versions) | {0}
 
@@ -229,8 +236,8 @@ def validate(led: dict, where: str) -> None:
         for field, allowed in (("quote", QUOTE), ("work", WORK), ("invoice", INVOICE)):
             if r.get(field) not in allowed:
                 p.append(f"request {rid} has an unknown {field} state '{r.get(field)}'")
-        if not _is_money(r.get("cost")):
-            p.append(f"request {rid} has an invalid cost")
+        if not _is_money(r.get("cost")) or not _is_money(r.get("approved_amount")):
+            p.append(f"request {rid} has an invalid cost or approved amount")
         if r.get("agreement_version", 0) not in vset:
             p.append(f"request {rid} points to agreement v{r.get('agreement_version')}, which doesn't exist")
         if r.get("round") is not None and r["round"] not in rset:
@@ -267,7 +274,7 @@ def migrate_v1(old: dict, project: str) -> dict:
         "version": 1, "effective": (old.get("created") or today())[:10], "note": "original (migrated)",
         "source": (old.get("baseline") or {}).get("source", ""), "approved_by": "", "evidence": "",
         "price": old.get("original_price"), "revisions_included": old.get("revisions_included"),
-        "scope": scope, "absorbs": [],
+        "scope": scope, "absorbs": [], "status": "agreed",
     })
     for n in range(1, int(old.get("revisions_used", 0)) + 1):
         led["rounds"].append({"round": n, "date": "", "note": "migrated", "agreement_version": 1,
@@ -301,6 +308,7 @@ def upgrade_v2(led: dict) -> dict:
     for v in led.get("agreement", []):
         if isinstance(v, dict):
             v.setdefault("absorbs", [])
+            v.setdefault("status", "agreed")  # before v2.2 every saved version governed
     led.setdefault("change_orders", [])
     led.setdefault("events", [])
     return led
@@ -427,16 +435,35 @@ class Store:
 # --------------------------------------------------------------------------- helpers
 
 def current_agreement(led: dict) -> dict:
-    if not led["agreement"]:
-        return {"version": 0, "price": None, "revisions_included": None, "scope": {}, "source": ""}
-    return led["agreement"][-1]
+    """The agreement that governs the project now: the latest version the client agreed to.
+    Proposed amendments are kept on record but don't change any verdict, limit or total."""
+    for v in reversed(led["agreement"]):
+        if v.get("status", "agreed") == "agreed":
+            return v
+    return {"version": 0, "price": None, "revisions_included": None, "scope": {}, "source": ""}
+
+
+def proposed_versions(led: dict) -> list:
+    newest = current_agreement(led)["version"]
+    return [v for v in led["agreement"] if v.get("status") == "proposed" and v["version"] > newest]
 
 
 def version_of(led: dict, n: int) -> dict:
     return led["agreement"][n - 1] if n else current_agreement(led)
 
 
+def round_money(value: Decimal, currency: str) -> Decimal:
+    return value.quantize(Decimal(1).scaleb(-minor_units(currency)), rounding=ROUND_HALF_UP)
+
+
 def cost_of(led: dict, hours=None, days=None, fixed=None, buffer=None):
+    """Price a request. The stored amount is rounded to the currency's minor units, so displayed
+    line items always add up to displayed totals."""
+    cost, how = _raw_cost(led, hours, days, fixed, buffer)
+    return (round_money(cost, led["currency"]) if cost is not None else None), how
+
+
+def _raw_cost(led: dict, hours=None, days=None, fixed=None, buffer=None):
     if fixed is not None:
         return dec(fixed, "--fixed"), "fixed price"
     if hours is None and days is None:
@@ -474,6 +501,36 @@ def billable(r: dict) -> bool:
     return (r["verdict"] in ("extra", "grey") or r.get("over_cap")) and not r.get("complimentary")
 
 
+def extra_like(r: dict) -> bool:
+    """Work that sits outside the agreed price: extra, grey, or a revision beyond the limit."""
+    return r["verdict"] in ("extra", "grey") or bool(r.get("over_cap"))
+
+
+def counts_as_accepted(r: dict) -> bool:
+    """Accepted, chargeable extra work. A grey item never counts, even if marked accepted."""
+    return billable(r) and r["quote"] == "accepted" and r["verdict"] != "grey"
+
+
+def review_flags(led: dict) -> list:
+    """Inconsistencies worth a human look. Reported, never silently fixed."""
+    cur = led["currency"]
+    flags = []
+    for r in led["requests"]:
+        tag = f"#{r['id']} {r['request']}"
+        if r["verdict"] == "grey" and r["quote"] == "accepted":
+            flags.append(f"{tag} is a grey area but marked accepted. Settle it (update {r['id']} --verdict extra "
+                         "--reason ...) or reset the quote; it isn't counted as revenue until then.")
+        if not extra_like(r) and not r.get("complimentary") and (r["quote"] != "n/a" or r["invoice"] != "n/a"):
+            flags.append(f"{tag} is {r['verdict']} work but has a quote/invoice state; it's covered by the agreement.")
+        if r["quote"] == "accepted" and r.get("approved_amount") is not None and r.get("cost") is not None \
+                and Decimal(r["approved_amount"]) != Decimal(r["cost"]):
+            flags.append(f"{tag} was approved at {money(Decimal(r['approved_amount']), cur)} but is recorded at "
+                         f"{money(Decimal(r['cost']), cur)}. Review required.")
+    for v in proposed_versions(led):
+        flags.append(f"Agreement v{v['version']} ({v.get('note', '')}) is proposed, not agreed: it doesn't govern yet.")
+    return flags
+
+
 def totals(led: dict) -> dict:
     """Money per bucket for extra/grey work. Each item lands in exactly one quote bucket."""
     buckets = ("accepted", "sent", "draft", "grey_open", "rejected", "expired", "complimentary")
@@ -485,7 +542,7 @@ def totals(led: dict) -> dict:
             continue
         if r.get("complimentary"):
             b = "complimentary"
-        elif r["verdict"] == "grey" and r["quote"] in ("draft", "sent"):
+        elif r["verdict"] == "grey" and r["quote"] in ("draft", "sent", "accepted"):
             b = "grey_open"
         else:
             b = r["quote"] if r["quote"] in buckets else "draft"
@@ -538,7 +595,8 @@ def cmd_init(a, st: Store) -> int:
         led["agreement"].append({"version": 1, "effective": today(), "note": "original", "source": "",
                                  "approved_by": "", "evidence": "",
                                  "price": str(dec(a.price, "--price")) if a.price is not None else None,
-                                 "revisions_included": revisions, "scope": {}, "absorbs": []})
+                                 "revisions_included": revisions, "scope": {}, "absorbs": [],
+                                 "status": "agreed"})
     log_event(led, "project created", f"rate {money(Decimal(led['rate']), led['currency'])}/{a.unit}")
     path = st.create(led, a.force)
     out(f"Started {a.client} / {a.project} at {path}")
@@ -546,8 +604,39 @@ def cmd_init(a, st: Store) -> int:
     return 0
 
 
+def check_absorbs(led: dict, absorbs: list) -> None:
+    if len(set(absorbs)) != len(absorbs):
+        fail("--absorbs lists the same request more than once.")
+    for rid in absorbs:
+        r = find(led, rid)
+        if not is_extra(r) or r.get("complimentary") or not counts_as_accepted(r):
+            fail(f"#{rid} can't be absorbed: only accepted, chargeable extras can be folded into an amendment "
+                 f"(it is {r['verdict']}, quote {r['quote']}{', courtesy' if r.get('complimentary') else ''}).")
+        if r.get("absorbed_in"):
+            fail(f"#{rid} is already part of agreement v{r['absorbed_in']}.")
+
+
+def put_in_force(led: dict, version: dict, prev: dict) -> None:
+    """What happens when a version becomes the governing agreement."""
+    absorbs = version.get("absorbs", [])
+    loose = [r for r in led["requests"] if counts_as_accepted(r) and not r.get("absorbed_in") and r["id"] not in absorbs]
+    if prev["version"] and prev.get("price") != version["price"] and loose and not absorbs:
+        out("Note: the price changed and there are accepted extras (" + ", ".join(f"#{r['id']}" for r in loose)
+            + "). If this amendment's price already includes them, record it with --absorbs ID so they aren't "
+              "counted twice in the project total.")
+    if prev["version"] and prev.get("revisions_included") != version["revisions_included"]:
+        out(f"Note: the revision limit changes from {prev.get('revisions_included')} to {version['revisions_included']} "
+            f"for rounds recorded from now on. The {len(led['rounds'])} round(s) already recorded keep the limit they had.")
+    for rid in absorbs:
+        find(led, rid)["absorbed_in"] = version["version"]
+
+
 def cmd_agreement(a, st: Store) -> int:
     led = st.load(a.client, a.project)
+    if a.approve is not None:
+        return approve_amendment(a, st, led)
+    if not a.file:
+        fail("Give --file with the agreement terms, or --approve N to record that the client agreed to amendment N.")
     try:
         data = json.loads(Path(a.file).read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
@@ -564,59 +653,73 @@ def cmd_agreement(a, st: Store) -> int:
     price = data.get("price", data.get("original_price", prev.get("price")))
     revisions = count(data["revisions_included"], "revisions_included") if "revisions_included" in data \
         else prev.get("revisions_included")
+    effective = data.get("effective") or today()
+    try:
+        dt.date.fromisoformat(str(effective))
+    except ValueError:
+        fail(f"'effective' must be a date like 2026-12-01, got '{effective}'.")
     absorbs = list(a.absorbs or [])
-
-    # Validate everything before touching the record.
-    if len(set(absorbs)) != len(absorbs):
-        fail("--absorbs lists the same request more than once.")
-    for rid in absorbs:
-        r = find(led, rid)
-        if not is_extra(r) or r.get("complimentary") or r["quote"] != "accepted":
-            fail(f"#{rid} can't be absorbed: only accepted, chargeable extras can be folded into an amendment "
-                 f"(it is {r['verdict']}, quote {r['quote']}{', courtesy' if r.get('complimentary') else ''}).")
-        if r.get("absorbed_in"):
-            fail(f"#{rid} is already part of agreement v{r['absorbed_in']}.")
+    check_absorbs(led, absorbs)  # validate everything before touching the record
     if absorbs and prev["version"] == 0:
         fail("--absorbs only makes sense for an amendment, after the original agreement is saved.")
 
+    number = len(led["agreement"]) + 1
+    agreed = number == 1 or bool(a.approved_by or a.evidence)
     version = {
-        "version": prev["version"] + 1, "effective": data.get("effective") or today(),
-        "note": a.note or ("original" if prev["version"] == 0 else "amendment"),
+        "version": number, "effective": str(effective),
+        "note": a.note or ("original" if number == 1 else "amendment"),
         "source": data.get("source", ""), "approved_by": a.approved_by or "", "evidence": a.evidence or "",
         "price": str(dec(price, "price")) if price is not None else None,
         "revisions_included": revisions,
         "scope": {**(prev.get("scope") or {}), **{k: v for k, v in data.items() if k in SCOPE_KEYS}},
-        "absorbs": absorbs,
+        "absorbs": absorbs, "status": "agreed" if agreed else "proposed",
     }
     # The very first agreement can fill in a version 1 that init created with only price/revisions.
-    if prev["version"] == 1 and not prev.get("scope") and not led["requests"] and not led["rounds"] and not a.note:
-        version["version"], version["note"] = 1, "original"
-        led["agreement"][-1] = version
+    if len(led["agreement"]) == 1 and not prev.get("scope") and not led["requests"] and not led["rounds"] and not a.note:
+        version["version"], version["note"], version["status"] = 1, "original", "agreed"
+        led["agreement"][0] = version
         log_event(led, "agreement saved", "version 1 (original)")
-    else:
-        if version["version"] > 1 and not (a.approved_by or a.evidence):
-            out("Note: amendments are stronger with --approved-by and --evidence (who agreed, and where).")
-        loose = [r for r in led["requests"] if billable(r) and r["quote"] == "accepted"
-                 and not r.get("absorbed_in") and r["id"] not in absorbs]
-        if version["version"] > 1 and prev.get("price") != version["price"] and loose and not absorbs:
-            out("Note: the price changed and there are accepted extras (" + ", ".join(f"#{r['id']}" for r in loose)
-                + "). If this amendment's price already includes them, run it with --absorbs ID so they aren't "
-                  "counted twice in the project total.")
-        if version["version"] > 1 and prev.get("revisions_included") != revisions:
-            done = len(led["rounds"])
-            out(f"Note: the revision limit changes from {prev.get('revisions_included')} to {revisions} for rounds "
-                f"recorded from now on. The {done} round(s) already recorded keep the limit they had.")
+    elif agreed:
         led["agreement"].append(version)
-        for rid in absorbs:
-            find(led, rid)["absorbed_in"] = version["version"]
-        log_event(led, "agreement saved", f"version {version['version']} ({version['note']})"
+        put_in_force(led, version, prev)
+        log_event(led, "agreement saved", f"version {number} ({version['note']}), agreed"
+                  + (f" by {a.approved_by}" if a.approved_by else "")
                   + (f", absorbs {', '.join('#' + str(i) for i in absorbs)}" if absorbs else ""))
+    else:
+        led["agreement"].append(version)
+        log_event(led, "amendment proposed", f"version {number} ({version['note']}), not agreed yet")
     st.save(led)
     v = version
     out(f"Saved agreement version {v['version']} ({v['note']}) for {led['client']} / {led['project']}: "
         f"{len(v['scope'].get('deliverables', []))} deliverable(s), {len(v['scope'].get('exclusions', []))} "
         f"exclusion(s), revision rounds: {v['revisions_included']}"
         + (f", price {money(Decimal(v['price']), led['currency'])}" if v["price"] else ""))
+    if v["status"] == "proposed":
+        out(f"This amendment is PROPOSED: it doesn't change verdicts, limits or totals until the client agrees. "
+            f"When they do:  agreement \"{led['client']}\" --project \"{led['project']}\" --approve {v['version']} "
+            "--approved-by NAME --evidence \"where they agreed\"")
+    return 0
+
+
+def approve_amendment(a, st: Store, led: dict) -> int:
+    n = a.approve
+    if not 1 <= n <= len(led["agreement"]):
+        fail(f"There's no agreement version {n}.")
+    v = led["agreement"][n - 1]
+    if v.get("status", "agreed") == "agreed":
+        fail(f"Agreement v{n} is already agreed.")
+    if not (a.approved_by or a.evidence):
+        fail("Record who agreed and where: --approved-by NAME --evidence \"email 3 Dec\".")
+    prev = current_agreement(led)
+    if prev["version"] > n:
+        fail(f"v{prev['version']} was agreed after v{n}, so v{n} can't take effect now. Save a new amendment instead.")
+    check_absorbs(led, v.get("absorbs", []))
+    v.update(status="agreed", approved_by=a.approved_by or v.get("approved_by", ""),
+             evidence=a.evidence or v.get("evidence", ""), approved_on=today())
+    put_in_force(led, v, prev)
+    log_event(led, "amendment agreed", f"version {n} agreed by {v['approved_by'] or '-'} ({v['evidence'] or '-'})")
+    st.save(led)
+    out(f"Agreement v{n} ({v.get('note', '')}) is now agreed and governs the project.")
     return 0
 
 
@@ -696,7 +799,12 @@ def cmd_log(a, st: Store) -> int:
 def cmd_update(a, st: Store) -> int:
     led = st.load(a.client, a.project)
     r = find(led, a.id)
+    cur = led["currency"]
     changes = []
+    was_accepted = r["quote"] == "accepted"
+    ever_invoiced = bool(r.get("ever_invoiced")) or r.get("invoice") in INVOICED
+
+    # 1. Verdict (settling a grey area, or a correction)
     if a.verdict:
         if a.verdict not in VERDICTS:
             fail(f"--verdict must be one of {', '.join(VERDICTS)}.")
@@ -705,63 +813,114 @@ def cmd_update(a, st: Store) -> int:
                  "(grey -> extra or included) or correcting a verdict.")
         if not a.reason:
             fail("Say why the verdict changes with --reason (e.g. 'client confirmed social sizes weren't included').")
-        if r.get("change_order") or r.get("absorbed_in") or r.get("invoice") in INVOICED:
+        if r.get("change_order") or r.get("absorbed_in") or ever_invoiced:
             fail(f"#{r['id']} is already on a change order, in an amendment, or invoiced; its verdict can't change now.")
+        if was_accepted:
+            fail(f"#{r['id']} is accepted by the client. Undo that first (update {r['id']} --quote sent, or "
+                 "--quote rejected), then change the verdict.")
         old = r["verdict"]
+        was = f"{old}, {money(Decimal(r['cost']), cur)}" if r.get("cost") else old
         r["verdict"] = a.verdict
         if a.verdict in ("extra", "grey") and r["quote"] == "n/a" and not r.get("complimentary"):
             r["quote"], r["invoice"] = "draft", "not_invoiced"
         if a.verdict == "included":
             r["quote"], r["invoice"], r["cost"], r["priced_as"] = "n/a", "n/a", None, "covered by the agreement"
-        r["note"] = (r.get("note", "") + f" Reclassified {old} -> {a.verdict}: {a.reason}").strip()
+        r["note"] = (r.get("note", "") + f" Reclassified {old} -> {a.verdict} (was {was}): {a.reason}").strip()
         changes.append(f"verdict {old} -> {a.verdict} ({a.reason})")
+
+    # 2. Price, judged against the state before this command
+    if any(v is not None for v in (a.hours, a.days, a.fixed)):
+        if ever_invoiced:
+            fail("This item has been invoiced, so its price is frozen. Log a correction as a new item instead.")
+        cost, how = cost_of(led, a.hours, a.days, a.fixed, a.buffer)
+        old_cost = r.get("cost")
+        r["cost"], r["priced_as"] = str(cost), how
+        changes.append(f"price {money(cost, cur)}")
+        if was_accepted and r.get("approved_amount") != str(cost) and a.quote != "accepted":
+            if a.reapproved_by:
+                r["approval"] = {"by": a.reapproved_by, "evidence": a.evidence or "", "date": today()}
+                r["approved_amount"] = str(cost)
+                changes.append(f"re-approved by {a.reapproved_by}")
+            else:
+                r.setdefault("previous_approvals", []).append({**(r.get("approval") or {}),
+                                                               "amount": r.get("approved_amount")})
+                r["approval"], r["approved_amount"], r["quote"] = {}, None, "sent"
+                prior = money(Decimal(old_cost), cur) if old_cost else "an earlier price"
+                out(f"Note: #{r['id']} was approved at {prior}. The new price {money(cost, cur)} needs the client's OK "
+                    "again, so the quote is back to 'sent'. If they already agreed, add --reapproved-by NAME.")
+                changes.append("quote back to sent (price changed after approval)")
+
+    # 3. States
     if a.status:
         if a.status not in OLD_STATUS:
             fail(f"--status must be one of {', '.join(OLD_STATUS)} (or use --quote/--work/--invoice).")
         for k, v in OLD_STATUS[a.status].items():
             r[k] = v
         changes.append(f"status {a.status}")
-    for field, value, allowed in (("quote", a.quote, QUOTE), ("work", a.work, WORK), ("invoice", a.invoice, INVOICE)):
+    for field, value, allowed in (("quote", a.quote, QUOTE), ("work", a.work, WORK)):
         if value is not None:
             if value not in allowed:
                 fail(f"--{field} must be one of {', '.join(allowed)}.")
             r[field] = value
             changes.append(f"{field} {value}")
+    if a.invoice is not None:
+        if a.invoice not in INVOICE:
+            fail(f"--invoice must be one of {', '.join(INVOICE)}.")
+        old_inv = r.get("invoice", "not_invoiced")
+        if INVOICE_RANK.get(a.invoice, 0) < INVOICE_RANK.get(old_inv, 0):
+            if not a.correction:
+                fail(f"Invoice states only move forward ({old_inv} -> {a.invoice} goes back). If this corrects a "
+                     "mistake, add --correction --reason \"...\".")
+            if not a.reason:
+                fail("A correction needs --reason.")
+            changes.append(f"invoice correction {old_inv} -> {a.invoice} ({a.reason})")
+        else:
+            changes.append(f"invoice {a.invoice}")
+        r["invoice"] = a.invoice
+        if a.invoice in INVOICED:
+            r["ever_invoiced"] = True
     if a.courtesy is not None:
+        if a.courtesy and ever_invoiced:
+            fail("This item has been invoiced, so it can't become a courtesy.")
         r["complimentary"] = a.courtesy
         if a.courtesy:
-            if r.get("invoice") in INVOICED:
-                fail("This item is already invoiced, so it can't become a courtesy.")
             r["quote"], r["invoice"] = "n/a", "n/a"
         changes.append("courtesy" if a.courtesy else "no longer courtesy")
-    invoice_changing = a.invoice is not None or a.status is not None or a.verdict is not None
-    if r.get("invoice") in INVOICED and invoice_changing:
-        if r.get("complimentary") or not billable(r):
-            fail("Courtesy, included and in-limit revision work can't be invoiced.")
-        if r.get("quote") != "accepted":
-            fail("Only accepted work can be invoiced. Set --quote accepted first (and record who approved it).")
-        if r["verdict"] == "grey":
-            fail("This is still a grey area. Settle it first: update ID --verdict extra --reason \"...\".")
-        if r.get("work") != "done" and not a.advance:
-            fail("The work isn't marked done. Invoice after --work done, or add --advance for an agreed upfront invoice.")
+
+    # 4. Approval
     if a.approved_by or a.evidence:
         r["approval"] = {"by": a.approved_by or r.get("approval", {}).get("by", ""),
                          "evidence": a.evidence or r.get("approval", {}).get("evidence", ""), "date": today()}
         changes.append(f"approval {r['approval']['by']} ({r['approval']['evidence']})")
-    if r.get("quote") == "accepted" and not (r.get("approval") or {}).get("by"):
+    if r["quote"] == "accepted" and not was_accepted:
+        r["approved_amount"] = r.get("cost")  # the price the client agreed to
+        if r.get("cost") is None:
+            out("Note: accepted without a price. Add one (--hours/--fixed) and record the client's OK for it.")
+
+    # 5. Rules on the final state (nothing is saved if one fails)
+    if r["verdict"] == "grey" and r["quote"] == "accepted":
+        fail(f"#{r['id']} is still a grey area. Settle it with the client first: update {r['id']} --verdict extra "
+             "--reason \"...\" (or included), then record the acceptance.")
+    if r.get("complimentary") and (r["quote"] not in ("n/a",) or r["invoice"] not in ("n/a",)):
+        fail("A courtesy item has no quote or invoice. Use --no-courtesy first if it should be charged.")
+    if not extra_like(r) and not r.get("complimentary") and (r["quote"] != "n/a" or r["invoice"] != "n/a"):
+        fail(f"#{r['id']} is {r['verdict']} work, covered by the agreed price, so it has no quote or invoice.")
+    invoice_changing = a.invoice is not None or a.status is not None or a.verdict is not None
+    if r.get("invoice") in INVOICED and invoice_changing:
+        if not billable(r):
+            fail("Courtesy, included and in-limit revision work can't be invoiced.")
+        if r.get("quote") != "accepted":
+            fail("Only accepted work can be invoiced. Set --quote accepted first (and record who approved it).")
+        if r.get("work") != "done" and not a.advance:
+            fail("The work isn't marked done. Invoice after --work done, or add --advance for an agreed upfront invoice.")
+    if r["quote"] == "accepted" and not (r.get("approval") or {}).get("by"):
         out("Note: record how the client approved it (--approved-by, --evidence) so there's proof later.")
-    if any(v is not None for v in (a.hours, a.days, a.fixed)):
-        if r.get("invoice") in INVOICED:
-            fail("This item is already invoiced; its price can't change. Log a correction as a new item instead.")
-        cost, how = cost_of(led, a.hours, a.days, a.fixed, a.buffer)
-        r["cost"], r["priced_as"] = str(cost), how
-        changes.append(f"price {money(cost, led['currency'])}")
     if a.note:
         r["note"] = a.note
     if changes:
         log_event(led, "request updated", f"#{r['id']}: " + "; ".join(changes))
     st.save(led)
-    c = f" {money(Decimal(r['cost']), led['currency'])}" if r.get("cost") else ""
+    c = f" {money(Decimal(r['cost']), cur)}" if r.get("cost") else ""
     out(f"#{r['id']}{c}: {r['verdict']}, quote {r['quote']}, work {r['work']}, invoice {r['invoice']}"
         + (", courtesy" if r.get("complimentary") else "") + f": {r['request']}")
     return 0
@@ -811,7 +970,7 @@ def cmd_change_order(a, st: Store) -> int:
         lines.append(f"**Timeline impact:** {md(a.timeline)}")
     if agr.get("price"):
         others = sum((Decimal(r["cost"]) for r in led["requests"]
-                      if billable(r) and r["quote"] == "accepted" and not r.get("absorbed_in")
+                      if counts_as_accepted(r) and not r.get("absorbed_in")
                       and r.get("cost") and r["id"] not in a.ids), Decimal(0))
         lines.append(f"**Project total with these items:** {money(Decimal(agr['price']) + others + total, cur)}")
     approved = [r for r in items if r["quote"] == "accepted" and (r.get("approval") or {}).get("by")]
@@ -857,11 +1016,12 @@ def build_report(led: dict) -> str:
     lines.append(f"- Revision rounds: {used}" + (f" of {last_cap} included" if last_cap is not None else " (no limit agreed)")
                  + (f" - **{over} over the limit**" if over else ""))
     if led["agreement"]:
-        lines += ["", "## Agreement history", "", "| Version | Effective | Note | Approved by | Price | Rounds |",
-                  "|---|---|---|---|---|---|"]
+        lines += ["", "## Agreement history", "", "| Version | Status | Effective | Note | Approved by | Price | Rounds |",
+                  "|---|---|---|---|---|---|---|"]
         for v in led["agreement"]:
             pv = money(Decimal(v["price"]), cur) if v.get("price") else "-"
-            lines.append(f"| {v['version']} | {md(v.get('effective', ''))} | {md(v.get('note', ''))} | "
+            status = v.get("status", "agreed") + (" (governs)" if v["version"] == agr["version"] else "")
+            lines.append(f"| {v['version']} | {status} | {md(v.get('effective', ''))} | {md(v.get('note', ''))} | "
                          f"{md(v.get('approved_by')) or '-'} | {pv} | {v.get('revisions_included', '-')} |")
     lines += ["", "## Extra work", "", "| | Items | Value |", "|---|---|---|"]
     for b, label in (("accepted", "Accepted by the client (billable)"), ("sent", "Quoted, waiting for an answer"),
@@ -882,6 +1042,9 @@ def build_report(led: dict) -> str:
     if m["complimentary"] > 0:
         pct = f" ({(m['complimentary'] / price * 100).quantize(Decimal('1'))}% of the agreed price)" if price else ""
         lines.append(f"\n**Given away so far:** {money(m['complimentary'], cur)}{pct}.")
+    flags = review_flags(led)
+    if flags:
+        lines += ["", "## Needs review", ""] + [f"- {md(f)}" for f in flags]
     lines += ["", "## Change log", "",
               "| # | Date | Request | Verdict | Agreement | Quote | Work | Invoice | Value | Based on |",
               "|---|---|---|---|---|---|---|---|---|---|"]
@@ -922,7 +1085,7 @@ def cmd_explain(a, st: Store) -> int:
     price = Decimal(agr["price"]) if agr.get("price") else None
     out(f"Agreed price: {money(price, cur) if price is not None else 'not recorded'} (agreement v{agr['version']}"
         + (f", {agr.get('note')}" if agr.get("note") else "") + ")")
-    on_top = [r for r in led["requests"] if billable(r) and r["quote"] == "accepted" and not r.get("absorbed_in") and r.get("cost")]
+    on_top = [r for r in led["requests"] if counts_as_accepted(r) and not r.get("absorbed_in") and r.get("cost")]
     absorbed = [r for r in led["requests"] if r.get("absorbed_in")]
     for r in on_top:
         out(f"  + #{r['id']} {r['request']}: {money(Decimal(r['cost']), cur)} ({r.get('priced_as', '')}; approved by "
@@ -942,11 +1105,16 @@ def cmd_explain(a, st: Store) -> int:
     if free:
         s = sum((Decimal(r["cost"]) for r in free), zero)
         out(f"Given away as courtesy: {money(s, cur)}  ({', '.join('#' + str(r['id']) for r in free)})")
-    left_out = [r for r in led["requests"] if r["verdict"] in ("extra", "grey") and not r.get("complimentary")
-                and r["quote"] != "accepted"]
+    left_out = [r for r in led["requests"] if billable(r) and not counts_as_accepted(r)]
     if left_out:
         out("Not counted in the total (not accepted): "
             + ", ".join(f"#{r['id']} ({r['verdict']}, {r['quote']})" for r in left_out))
+    flags = review_flags(led)
+    if flags:
+        out("")
+        out("Needs review:")
+        for f in flags:
+            out(f"  - {f}")
     return 0
 
 
@@ -1052,7 +1220,8 @@ def main(argv=None) -> int:
     for name in ("agreement", "baseline"):
         p = sub.add_parser(name)
         client(p)
-        p.add_argument("--file", required=True)
+        p.add_argument("--file")
+        p.add_argument("--approve", type=int, metavar="N", help="record that the client agreed to proposed amendment N")
         p.add_argument("--note")
         p.add_argument("--approved-by")
         p.add_argument("--evidence")
@@ -1078,6 +1247,8 @@ def main(argv=None) -> int:
     p.add_argument("--work")
     p.add_argument("--invoice")
     p.add_argument("--advance", action="store_true", help="allow invoicing before the work is done (agreed upfront)")
+    p.add_argument("--correction", action="store_true", help="move an invoice state backwards to fix a mistake (needs --reason)")
+    p.add_argument("--reapproved-by", help="the client already agreed to the new price")
     p.add_argument("--status", help="shortcut: pending, approved, free, declined, done")
     cg = p.add_mutually_exclusive_group()
     cg.add_argument("--courtesy", dest="courtesy", action="store_true", default=None)

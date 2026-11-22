@@ -62,7 +62,7 @@ class LogoAcceptance(Base):
         self.run_cmd("log", "Bloom", "--request", "Fix squished e", "--verdict", "included")
         r = self.rec()
         self.assertEqual([x["round"] for x in r["requests"][:2]], [1, 1], "one message = one round")
-        self.assertEqual(r["requests"][3]["cost"], "150")
+        self.assertEqual(Decimal(r["requests"][3]["cost"]), Decimal("150"))
         self.assertIsNone(r["requests"][4]["cost"])
         t = sl.totals(r)
         self.assertEqual(t["money"]["draft"], 150)
@@ -113,10 +113,11 @@ class Agreements(Base):
         self.assertNotIn("______", co)
         f = Path(self.d) / "amend.json"
         f.write_text(json.dumps({"deliverables": ["3 concepts", "Cake box"], "price": 750}))
-        warn = self.run_cmd("agreement", "Bloom", "--file", str(f), "--note", "Added box")
+        warn = self.run_cmd("agreement", "Bloom", "--file", str(f), "--note", "Added box", "--approved-by", "Priya")
         self.assertIn("--absorbs", warn, "warns when the price changes with loose accepted extras")
         self.assertIn("Project total:** $900", self.run_cmd("report", "Bloom"), "without --absorbs it adds on top")
-        self.run_cmd("agreement", "Bloom", "--file", str(f), "--note", "Added box (absorbs #1)", "--absorbs", "1")
+        self.run_cmd("agreement", "Bloom", "--file", str(f), "--note", "Added box (absorbs #1)", "--absorbs", "1",
+                     "--approved-by", "Priya")
         rep = self.run_cmd("report", "Bloom")
         self.assertIn("Project total:** $750", rep)
         self.assertIn("already inside the amended price", rep)
